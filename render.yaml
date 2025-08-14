@@ -3,4 +3,7 @@ services:
     name: ai-rank-bot
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python App.py
+    startCommand: python app.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
