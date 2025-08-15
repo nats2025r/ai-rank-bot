@@ -1,4 +1,4 @@
-# app.py — полная версия
+# app.py — полная версия в стиле «как раньше», с одиночной загрузкой тикеров и защитой от падений
 
 import os
 import time
@@ -39,32 +39,66 @@ HARD_SP500 = [
     "ETN","INTC","BLK","DE","PLTR","ELV","ADP","MDT","MU","GEV","MDLZ",
     "AXP","C","GILD","CVS","PGR","PANW","SCHW","REGN","T","COP","LLYVA",
     "ZTS","KLAC","MO","MAR","CI","VRTX","ANET","FI","CSX","LMT","PH","MMC",
-    "ICE","SO","DUK","PNC","SBUX","EQIX","ATVI","AON","ADI","SHW",
-    "USB","FDX","NKE","BDX","GM","F","HAL","NOC","TT","ROP","PSX","KMI",
-    "EA","ORLY","ROST","CTAS","HUM","AEP","AIG","KHC","GIS","MNST","MCO",
-    "PCAR","CEG","MRNA","PAYX","HSY","ADM","OXY","D","EXC","ED","BK","KDP",
-    "AFL","A","ALB","CRWD","FTNT","SNPS","CDNS","MCHP","NXPI","APH"
+    "ICE","SO","DUK","PNC","SBUX","EQIX","ADI","SHW","USB","FDX","NKE","BDX",
+    "GM","F","HAL","NOC","TT","ROP","PSX","KMI","EA","ORLY","ROST","CTAS",
+    "HUM","AEP","AIG","KHC","GIS","MNST","MCO","PCAR","CEG","MRNA","PAYX",
+    "HSY","ADM","OXY","D","EXC","ED","BK","KDP","AFL","A","ALB","CRWD",
+    "FTNT","SNPS","CDNS","MCHP","NXPI","APH"
 ]
 
 # ========= утилиты загрузки (одиночные запросы) =========
-def fetch_series(ticker: str, period="3mo", tries=3, pause=1.0):
-    """Надёжная одиночная загрузка цены по тикеру (Adj Close/Close)."""
-    for i in range(tries):
-        try:
-            df = yf.download(
-                ticker, period=period, interval="1d",
-                auto_adjust=False, progress=False, threads=False
-            )
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                s = df["Adj Close"] if "Adj Close" in df.columns else df.get("Close")
-                if s is not None:
-                    s = s.dropna()
+def _try_download_once(ticker: str, period="3mo"):
+    """
+    Одна попытка загрузки: сначала yf.download, если пусто — Ticker().history.
+    Возвращает DataFrame ИЛИ None.
+    """
+    # 1) быстрый путь
+    try:
+        df = yf.download(
+            ticker, period=period, interval="1d",
+            auto_adjust=False, progress=False, threads=False
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception as e:
+        logging.debug("yf.download error for %s: %s", ticker, e)
+
+    # 2) альтернативный путь
+    try:
+        hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
+        if isinstance(hist, pd.DataFrame) and not hist.empty:
+            return hist
+    except Exception as e:
+        logging.debug("Ticker().history error for %s: %s", ticker, e)
+
+    return None
+
+def fetch_series(ticker: str, period="3mo", tries=4, pause=1.0):
+    """
+    Надёжная одиночная загрузка цены по тикеру (Adj Close/Close) с ретраями.
+    Для SPY есть fallback: VOO -> ^GSPC.
+    Возвращает pd.Series или None.
+    """
+    tick = ticker.upper()
+    candidates = [tick]
+    if tick == "SPY":  # fallback для бенчмарка
+        candidates += ["VOO", "^GSPC"]
+
+    for name in candidates:
+        for i in range(tries):
+            df = _try_download_once(name, period=period)
+            if df is not None and not df.empty:
+                col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+                if col:
+                    s = df[col].dropna()
                     if len(s) >= 22:
-                        s.name = ticker
+                        s.name = name
+                        if name != tick:
+                            logging.warning("Fallback for %s -> %s", tick, name)
                         return s
-        except Exception as e:
-            logging.warning("fetch_series(%s) failed (%s/%s): %s", ticker, i+1, tries, e)
-        time.sleep(pause)
+            time.sleep(pause)
+
+    logging.warning("No data for %s (period=%s)", ticker, period)
     return None
 
 def metric_21(series: pd.Series):
@@ -86,9 +120,13 @@ def load_sp500_tickers():
 # ========= команды =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Я бот AI-рейтинг акций.\n"
-        "Напиши /strong чтобы получить сильные идеи.\n"
-        "Команды: /ping /sp500 [5|10] /sp5005 /sp50010 /etf [all|core|x2x3] [N] /mix [N]"
+        "Я на связи ✅\n\n"
+        "Команды:\n"
+        "/ping — проверить, что живой\n"
+        "/sp500 [5|10] — топ акций S&P 500, обогнавших SPY (21д), по score\n"
+        "/sp5005 и /sp50010 — быстрые варианты\n"
+        "/etf [all|core|x2x3] [N] — ETF по score\n"
+        "/mix [N] — смешанный список (S&P500 + ETF)"
     )
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,10 +140,11 @@ async def sp500(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         n = 5
 
+    # бенчмарк с fallback
     sb = fetch_series(BENCH, period="3mo")
     mb = metric_21(sb)
     if not mb:
-        await update.message.reply_text("Не удалось получить данные SPY.")
+        await update.message.reply_text("Не удалось получить данные SPY/VOO/^GSPC.")
         return
     bench_ret = mb[1]
 
@@ -203,7 +242,8 @@ async def mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     n = max(1, min(n, 30))
 
     rows = []
-    for t in (HARD_SP500 + ALL_ETF):
+    universe = HARD_SP500 + ALL_ETF
+    for t in universe:
         s = fetch_series(t, period="3mo")
         m = metric_21(s)
         if not m:
