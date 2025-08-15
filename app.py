@@ -52,3 +52,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong")
+
