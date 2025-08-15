@@ -5,7 +5,6 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from dotenv import load_dotenv
-from sklearn.preprocessing import MinMaxScaler
 import numpy as np
 
 # Загружаем переменные окружения
