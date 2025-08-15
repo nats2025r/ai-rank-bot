@@ -1,12 +1,18 @@
 import os, logging
 from telegram.ext import Application, CommandHandler
-from app import start, strong, ping   # <-- только эти три
+
+# импортируем все команды из app.py
+from app import (
+    start, ping, strong,
+    sp500, sp5005, sp50010,
+    etf, mix
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # например, https://ai-rank-bot-1.onrender.com
+PUBLIC_URL = os.getenv("PUBLIC_URL")
 
 def main():
     if not TOKEN:
@@ -16,10 +22,16 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Регистрируем только существующие команды
+    # Регистрируем ВСЕ команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
     app.add_handler(CommandHandler("strong", strong))
+
+    app.add_handler(CommandHandler("sp500", sp500))
+    app.add_handler(CommandHandler("sp5005", sp5005))
+    app.add_handler(CommandHandler("sp50010", sp50010))
+    app.add_handler(CommandHandler("etf", etf))
+    app.add_handler(CommandHandler("mix", mix))
 
     url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
     logging.info("Starting webhook on %s", url)
