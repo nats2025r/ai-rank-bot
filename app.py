@@ -1,5 +1,6 @@
 import os
 import logging
+import asyncio
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -7,19 +8,17 @@ import numpy as np
 from flask import Flask, request
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ================== ЛОГИ ==================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ai-rank-bot")
 
 # ================== ENV ===================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-URL = os.getenv("WEBHOOK_URL")  # например: https://ai-rank-bot-1.onrender.com
+URL   = os.getenv("WEBHOOK_URL")  # например: https://ai-rank-bot-1.onrender.com
 if not TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN")
 if not URL:
@@ -30,9 +29,9 @@ app = Flask(__name__)
 tg_app = Application.builder().token(TOKEN).build()
 
 # ================== КОНСТ =================
-DAYS = 21
+DAYS   = 21
 PERIOD = "6mo"
-BENCH = "SPY"
+BENCH  = "SPY"
 
 # ---------- первые ~250 тикеров S&P 500 (зашиты прямо в код) ----------
 SPX250 = [
@@ -68,7 +67,7 @@ ETF_CORE = ["SPY","QQQ","DIA","IWM","ARKK","XLF","XLK","XLE"]
 ETF_X2X3 = ["TQQQ","SPXL","UPRO","SOXL","SQQQ","SPXS"]
 ETF_ALL  = ETF_CORE + ETF_X2X3
 
-# ================== УТИЛИТЫ =================
+# ================== ВСПОМОГАТЕЛЬНОЕ =================
 def _download_batch(tickers: list[str]) -> pd.DataFrame:
     data = yf.download(
         tickers=tickers,
@@ -87,7 +86,7 @@ def _enough(close: pd.Series, days: int) -> bool:
     return close.dropna().size >= days + 1
 
 def _calc_scores_for_list(tickers: list[str], benchmark: str = BENCH, days: int = DAYS) -> dict[str, float]:
-    data = _download_batch(tickers)
+    data  = _download_batch(tickers)
     bench = yf.download(benchmark, period=PERIOD, progress=False)
     if data.empty or bench.empty:
         log.warning("Пустые данные: data.empty=%s bench.empty=%s", data.empty, bench.empty)
@@ -97,10 +96,9 @@ def _calc_scores_for_list(tickers: list[str], benchmark: str = BENCH, days: int 
     if not _enough(bench_close, days):
         log.warning("Недостаточно истории для %s", benchmark)
         return {}
-
     ret_bench = bench_close.iloc[-1] / bench_close.iloc[-days] - 1
-    out: dict[str, float] = {}
 
+    out: dict[str, float] = {}
     for t in tickers:
         try:
             if ("Close", t) not in data.columns or ("Volume", t) not in data.columns:
@@ -129,25 +127,23 @@ def _calc_scores_for_list(tickers: list[str], benchmark: str = BENCH, days: int 
 
 def _parse_n(args, default=10, minv=3, maxv=50) -> int:
     try:
-        if args and len(args) > 0:
-            n = int(args[0])
-        else:
-            n = default
+        n = int(args[0]) if args else default
     except:
         n = default
     return max(minv, min(maxv, n))
 
-# ================== ХЭНДЛЕРЫ =================
+# ================== КОМАНДЫ =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я AI-рейтинг акций.\n\n"
         "Команды:\n"
         "/wake — разбудить/прогреть\n"
         "/ping — проверить связь\n"
+        "/diag — диагностика\n"
         "/sp500 [N] — топ N из первых 250 тикеров\n"
         "/sp5005 | /sp50010 — быстрые пресеты\n"
         "/etf core|all|x2x3 [N] — рейтинг ETF\n"
-        "/mix [N] — SPX250 + все ETF"
+        "/mix [N] — SPX250 + ETF"
     )
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -155,14 +151,42 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        _ = yf.download(BENCH, period="5d", progress=False)
+        _ = yf.download(BENCH, period="5d", progress=False, threads=False)
         await update.message.reply_text("Готов к работе ⚡️")
     except Exception as e:
         await update.message.reply_text(f"Wake error: {e}")
 
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        info = await tg_app.bot.get_webhook_info()
+        wh = info.url or "<none>"
+        wh_state = f"ok (pending: {info.pending_update_count})" if info.url else "not set"
+    except Exception as e:
+        wh = f"error: {e}"
+        wh_state = "error"
+
+    yf_msg = ""
+    try:
+        df = yf.download("SPY", period="5d", progress=False, threads=False)
+        if df.empty:
+            yf_msg = "SPY: пустой DataFrame"
+        else:
+            yf_msg = f"SPY ok, last close={float(df['Close'].dropna().iloc[-1]):.2f}"
+    except Exception as e:
+        yf_msg = f"yfinance exception: {type(e).__name__}: {e}"
+
+    text = (
+        "<b>DIAG</b>\n"
+        f"- webhook_url (env): {os.getenv('WEBHOOK_URL')}\n"
+        f"- getWebhookInfo: {wh} [{wh_state}]\n"
+        f"- yfinance: {yf_msg}\n"
+        "versions: py, ptb 20.3, flask 2.3.2, yf 0.2.26\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
 async def _rank_and_reply(update: Update, tickers: list[str], n: int, label: str):
     await update.message.reply_text(f"Считаю рейтинг {label}… (N={n}, D={DAYS})")
-    scores = await tg_app.run_in_executor(None, _calc_scores_for_list, tickers)
+    scores = await asyncio.to_thread(_calc_scores_for_list, tickers)
     if not scores:
         await update.message.reply_text(f"Не удалось получить данные {BENCH}.")
         return
@@ -206,39 +230,55 @@ async def cmd_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
     combo = SPX250 + ETF_ALL
     await _rank_and_reply(update, combo, n, "Mix (SPX250 + ETF)")
 
-# ================== ROUTES & BOOT ===========
-# Telegram handlers
+# ================== РЕГИСТРАЦИЯ КОМАНД =================
 tg_app.add_handler(CommandHandler("start",   cmd_start))
 tg_app.add_handler(CommandHandler("ping",    cmd_ping))
 tg_app.add_handler(CommandHandler("wake",    cmd_wake))
+tg_app.add_handler(CommandHandler("diag",    cmd_diag))
 tg_app.add_handler(CommandHandler("sp500",   cmd_sp500))
 tg_app.add_handler(CommandHandler("sp5005",  cmd_sp5005))
 tg_app.add_handler(CommandHandler("sp50010", cmd_sp50010))
 tg_app.add_handler(CommandHandler("etf",     cmd_etf))
 tg_app.add_handler(CommandHandler("mix",     cmd_mix))
 
-# Flask endpoints
-@app.route("/")
+# ================== FLASK ROUTES =================
+@app.route("/", methods=["GET"])
 def root():
-    return "ok"  # healthcheck/wake через браузер
+    return "ok", 200  # healthcheck
+
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
+
+@app.route("/wake-http", methods=["GET"])
+def wake_http():
+    try:
+        _ = yf.download(BENCH, period="5d", progress=False, threads=False)
+        return "warmed", 200
+    except Exception as e:
+        return f"wake error: {e}", 500
 
 @app.route(f"/webhook/{TOKEN}", methods=["POST"])
 def webhook():
     update = Update.de_json(request.get_json(force=True), tg_app.bot)
     tg_app.update_queue.put_nowait(update)
-    return "ok"
+    return "ok", 200
 
-# Entrypoint
+# ================== ENTRYPOINT =================
 if __name__ == "__main__":
-    import asyncio
     async def main():
         webhook_url = f"{URL}/webhook/{TOKEN}"
+
+        # запустить PTB
         await tg_app.initialize()
         await tg_app.start()
+
+        # настроить вебхук
         await tg_app.bot.delete_webhook(drop_pending_updates=True)
         await tg_app.bot.set_webhook(webhook_url, allowed_updates=["message"])
         log.info("Webhook установлен: %s", webhook_url)
 
+        # запустить Flask (блокирующий) в отдельном потоке
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             None, lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
