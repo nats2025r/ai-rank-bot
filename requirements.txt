@@ -1,3 +1,5 @@
+setuptools>=68
+wheel>=0.41
 python-telegram-bot==20.3
 Flask==2.3.2
 yfinance==0.2.26
