@@ -1,9 +1,7 @@
 services:
-  - type: worker
+  - type: web
     name: ai-rank-bot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    envVars:
-      - key: BOT_TOKEN
-        sync: false
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
