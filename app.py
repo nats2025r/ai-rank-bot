@@ -1,286 +1,250 @@
-# app.py — полная версия в стиле «как раньше», с одиночной загрузкой тикеров и защитой от падений
-
 import os
-import time
 import logging
-import pandas as pd
 import yfinance as yf
+import pandas as pd
+import numpy as np
+
+from flask import Flask, request
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ========= базовая настройка =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ================== ЛОГИ ==================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+log = logging.getLogger("ai-rank-bot")
+
+# ================== ENV ===================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+URL = os.getenv("WEBHOOK_URL")  # например: https://ai-rank-bot-1.onrender.com
+if not TOKEN:
+    raise RuntimeError("Не найден BOT_TOKEN")
+if not URL:
+    raise RuntimeError("Не найден WEBHOOK_URL")
 
+# ================== APPs ==================
+app = Flask(__name__)
+tg_app = Application.builder().token(TOKEN).build()
+
+# ================== КОНСТ =================
+DAYS = 21
+PERIOD = "6mo"
 BENCH = "SPY"
 
-# ========= ETF =========
-CORE_ETF = [
-    "SPY","VOO","IVV","VTI","QQQ","DIA","IWM","IWB","IJH","IJR",
-    "XLK","XLF","XLE","XLY","XLP","XLV","XLI","XLB","XLRE","XLU",
-    "SMH","SOXX","IBB","ARKK","HYG","LQD","EEM","IEMG","GLD","SLV","USO"
+# ---------- первые ~250 тикеров S&P 500 (зашиты прямо в код) ----------
+SPX250 = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO","JPM","V","UNH","TSLA",
+    "XOM","WMT","MA","JNJ","PG","HD","COST","MRK","ADBE","PEP","ABBV","NFLX","CRM","KO","CSCO",
+    "ACN","ORCL","TMO","AMD","MCD","WELL","DHR","LIN","INTU","CMCSA","WFC","TXN","AMAT","MS",
+    "COP","NEE","INTC","VRTX","PFE","PM","GE","LOW","CVX","BX","HON","NOW","IBM","CAT","AMGN",
+    "SCHW","LMT","BKNG","SPGI","ELV","UPS","QCOM","SBUX","PLD","UNP","DE","GS","RTX","MDT",
+    "BLK","AXP","ISRG","ADI","TJX","GILD","MO","MMC","CI","SYK","CB","UBER","ZTS","REGN",
+    "PYPL","C","ETN","T","KLAC","FI","SO","MRVL","BDX","DUK","PGR","PNC","EQIX","EOG",
+    "ABNB","ICE","PH","ITW","SHW","CSX","ADP","EL","FDX","APD","AON","HCA","NKE","SLB","BK",
+    "WM","MPC","EMR","GM","CHTR","TT","MAR","AEP","KMI","MMM","ORLY","ROP","CL","MCO",
+    "HUM","SPG","DAL","PXD","HAL","LRCX","MNST","D","KR","CCI","KHC","LULU","TRV","AIG","CDNS",
+    "CEG","DD","GIS","PSX","MSI","SRE","CTAS","EW","STZ","PCAR","OXY","CMG","NOC","ADM","ED",
+    "A","PRU","KMB","TEL","USB","DHI","ROST","IDXX","AZO","PAYX","TGT","BIIB","ECL","ALL",
+    "HLT","F","VLO","WBA","AFL","KEYS","HPQ","YUM","ODFL","EXC","AMP","MTB","DLR",
+    "ALB","KDP","DTE","PHM","VRSK","FTNT","ES","LEN","HSY","HES","CTVA","NEM","GWW","RSG",
+    "CDW","XEL","WTW","OKE","IQV","AEE","SYY","EA","ZBH","PAYC","WEC","CE","GLW","MSCI","EIX",
+    "ROK","SWK","DOV","WMB","DVN","NUE","RMD","FANG","VICI","CMS","CNC","PPL","PEAK",
+    "IRM","ACGL","WAT","ILMN","FTV","BAX","CARR","HIG","VTR","OTIS","HBAN","ON","RF","HPE",
+    "COF","MTD","WDC","URI","MLM","FERG","TSCO","CFG","MCHP","CTSH","EXR","BALL","BBY","CF",
+    "EBAY","PTC","DOW","DG","DRI","ETSY","KMX","ALGN","LYB","MKC","CAG","PKI","ZBRA","AAL",
+    "NRG","GNRC","LVS","IFF","BRO","ENPH","PWR","STT","TRGP","APA","NDAQ","NTRS","MCK","LKQ",
+    "WRB","EPAM","FICO","STE","TDG","HUBB","CPRT","ANET","PCG","FAST","BR","CBOE","HWM","TTWO",
+    "EXPE","MTCH","MOS","AES","SWKS","CHD","BBWI","TROW","NVR","ESS","REG","ULTA","TSN","HST",
+    "VMC","CME","FSLR","NTAP","KEY","ETR","BIO","RJF","JBHT","AVB","INVH","SJM",
+    "NWL","PARA","HAS","SEE","DGX","HSIC","JKHY","LHX","RCL","CCL","AAP","AOS","AKAM","GL",
+    "INCY","WRK","GEN","CPB","BKR","BXP"
 ]
-LEVERAGED_ETF = [
-    "SSO","SPXL","UPRO","QLD","TQQQ","UWM","TNA","DDM","UDOW",
-    "TECL","FAS","SOXL","LABU","UCO","GUSH","EDC","YINN"
-]
-ALL_ETF = CORE_ETF + LEVERAGED_ETF
 
-# ========= «жёсткий» список S&P 500 (сокр. подмножество) =========
-HARD_SP500 = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","BRK-B","LLY","AVGO",
-    "TSM","TSLA","WMT","JPM","XOM","V","UNH","PG","MA","ORCL","COST","HD",
-    "JNJ","MRK","NFLX","ABBV","ADBE","CVX","PEP","KO","CRM","BAC","TMO",
-    "AMD","ACN","LIN","MCD","CSCO","WFC","ABT","TXN","MS","INTU","PFE",
-    "PM","IBM","CMCSA","QCOM","AMAT","DIS","DHR","UBER","RTX","GE","WELL",
-    "CAT","BX","ISRG","AMGN","GS","SYK","LRCX","NOW","SPGI","BKNG","HON",
-    "ETN","INTC","BLK","DE","PLTR","ELV","ADP","MDT","MU","GEV","MDLZ",
-    "AXP","C","GILD","CVS","PGR","PANW","SCHW","REGN","T","COP","LLYVA",
-    "ZTS","KLAC","MO","MAR","CI","VRTX","ANET","FI","CSX","LMT","PH","MMC",
-    "ICE","SO","DUK","PNC","SBUX","EQIX","ADI","SHW","USB","FDX","NKE","BDX",
-    "GM","F","HAL","NOC","TT","ROP","PSX","KMI","EA","ORLY","ROST","CTAS",
-    "HUM","AEP","AIG","KHC","GIS","MNST","MCO","PCAR","CEG","MRNA","PAYX",
-    "HSY","ADM","OXY","D","EXC","ED","BK","KDP","AFL","A","ALB","CRWD",
-    "FTNT","SNPS","CDNS","MCHP","NXPI","APH"
-]
+# ---------- ETF наборы ----------
+ETF_CORE = ["SPY","QQQ","DIA","IWM","ARKK","XLF","XLK","XLE"]
+ETF_X2X3 = ["TQQQ","SPXL","UPRO","SOXL","SQQQ","SPXS"]
+ETF_ALL  = ETF_CORE + ETF_X2X3
 
-# ========= утилиты загрузки (одиночные запросы) =========
-def _try_download_once(ticker: str, period="3mo"):
-    """
-    Одна попытка загрузки: сначала yf.download, если пусто — Ticker().history.
-    Возвращает DataFrame ИЛИ None.
-    """
-    # 1) быстрый путь
-    try:
-        df = yf.download(
-            ticker, period=period, interval="1d",
-            auto_adjust=False, progress=False, threads=False
-        )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        logging.debug("yf.download error for %s: %s", ticker, e)
-
-    # 2) альтернативный путь
-    try:
-        hist = yf.Ticker(ticker).history(period=period, interval="1d", auto_adjust=False)
-        if isinstance(hist, pd.DataFrame) and not hist.empty:
-            return hist
-    except Exception as e:
-        logging.debug("Ticker().history error for %s: %s", ticker, e)
-
-    return None
-
-def fetch_series(ticker: str, period="3mo", tries=4, pause=1.0):
-    """
-    Надёжная одиночная загрузка цены по тикеру (Adj Close/Close) с ретраями.
-    Для SPY есть fallback: VOO -> ^GSPC.
-    Возвращает pd.Series или None.
-    """
-    tick = ticker.upper()
-    candidates = [tick]
-    if tick == "SPY":  # fallback для бенчмарка
-        candidates += ["VOO", "^GSPC"]
-
-    for name in candidates:
-        for i in range(tries):
-            df = _try_download_once(name, period=period)
-            if df is not None and not df.empty:
-                col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
-                if col:
-                    s = df[col].dropna()
-                    if len(s) >= 22:
-                        s.name = name
-                        if name != tick:
-                            logging.warning("Fallback for %s -> %s", tick, name)
-                        return s
-            time.sleep(pause)
-
-    logging.warning("No data for %s (period=%s)", ticker, period)
-    return None
-
-def metric_21(series: pd.Series):
-    """21-дневная доходность, волатильность и score=ret−vol."""
-    if series is None or len(series) < 22:
-        return None
-    pct = series.pct_change()
-    tail = pct.tail(21).dropna()
-    if len(tail) < 10:
-        return None
-    ret21 = float(tail.sum())
-    vol21 = float(tail.std())
-    score = float(ret21 - vol21)
-    return score, ret21, vol21
-
-def load_sp500_tickers():
-    return HARD_SP500
-
-# ========= команды =========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Я на связи ✅\n\n"
-        "Команды:\n"
-        "/ping — проверить, что живой\n"
-        "/sp500 [5|10] — топ акций S&P 500, обогнавших SPY (21д), по score\n"
-        "/sp5005 и /sp50010 — быстрые варианты\n"
-        "/etf [all|core|x2x3] [N] — ETF по score\n"
-        "/mix [N] — смешанный список (S&P500 + ETF)"
+# ================== УТИЛИТЫ =================
+def _download_batch(tickers: list[str]) -> pd.DataFrame:
+    data = yf.download(
+        tickers=tickers,
+        period=PERIOD,
+        group_by="column",
+        auto_adjust=False,
+        progress=False,
+        threads=True,
     )
+    if isinstance(data.columns, pd.MultiIndex):
+        return data
+    data.columns = pd.MultiIndex.from_product([data.columns, [tickers[0]]])
+    return data
 
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
+def _enough(close: pd.Series, days: int) -> bool:
+    return close.dropna().size >= days + 1
 
-# ---------- /sp500 ----------
-async def sp500(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        n = int(context.args[0]) if context.args else 5
-        n = 10 if n >= 10 else 5
-    except Exception:
-        n = 5
+def _calc_scores_for_list(tickers: list[str], benchmark: str = BENCH, days: int = DAYS) -> dict[str, float]:
+    data = _download_batch(tickers)
+    bench = yf.download(benchmark, period=PERIOD, progress=False)
+    if data.empty or bench.empty:
+        log.warning("Пустые данные: data.empty=%s bench.empty=%s", data.empty, bench.empty)
+        return {}
 
-    # бенчмарк с fallback
-    sb = fetch_series(BENCH, period="3mo")
-    mb = metric_21(sb)
-    if not mb:
-        await update.message.reply_text("Не удалось получить данные SPY/VOO/^GSPC.")
-        return
-    bench_ret = mb[1]
+    bench_close = bench["Close"].dropna()
+    if not _enough(bench_close, days):
+        log.warning("Недостаточно истории для %s", benchmark)
+        return {}
 
-    rows = []
-    for t in load_sp500_tickers():
-        s = fetch_series(t, period="3mo")
-        m = metric_21(s)
-        if not m:
-            continue
-        score, r21, vol = m
-        if r21 > bench_ret:
-            rows.append((t, score, r21, vol))
+    ret_bench = bench_close.iloc[-1] / bench_close.iloc[-days] - 1
+    out: dict[str, float] = {}
 
-    if not rows:
-        await update.message.reply_text("Сейчас нет акций, обогнавших SPY за 21д.")
-        return
-
-    rows.sort(key=lambda x: x[1], reverse=True)
-    top = rows[:n]
-    text = (
-        f"Топ S&P 500, обогнавших SPY за 21д (score = 21д рост − вола, показываю {n}):\n" +
-        "\n".join(
-            f"{i+1:>2}) {t:<6} | score={s:.4f} | 21д={r:.2%} | vol={v:.4f}"
-            for i, (t, s, r, v) in enumerate(top)
-        )
-    )
-    await update.message.reply_text(text)
-
-async def sp5005(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["5"]
-    await sp500(update, context)
-
-async def sp50010(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.args = ["10"]
-    await sp500(update, context)
-
-# ---------- /etf ----------
-def pick_etf_universe(arg: str | None):
-    if not arg:
-        return ALL_ETF, "all"
-    a = arg.lower()
-    if a == "core":
-        return CORE_ETF, "core"
-    if a in ("x2x3", "lev", "leveraged"):
-        return LEVERAGED_ETF, "x2x3"
-    return ALL_ETF, "all"
-
-async def etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uni = "all"
-    n = 5
-    if context.args:
-        a0 = context.args[0].lower()
-        if a0.isdigit():
-            n = int(a0)
-        else:
-            _, uni = pick_etf_universe(a0)
-        if len(context.args) >= 2:
-            try:
-                n = int(context.args[1])
-            except Exception:
-                pass
-    n = max(1, min(n, 25))
-    tickers, uni = pick_etf_universe(uni)
-
-    rows = []
     for t in tickers:
-        s = fetch_series(t, period="3mo")
-        m = metric_21(s)
-        if not m:
-            continue
-        sc, r, v = m
-        rows.append((t, sc, r, v))
+        try:
+            if ("Close", t) not in data.columns or ("Volume", t) not in data.columns:
+                continue
+            close = data[("Close", t)].dropna()
+            volm  = data[("Volume", t)].dropna()
+            if not _enough(close, days) or volm.tail(days * 3).dropna().empty:
+                continue
 
-    if not rows:
-        await update.message.reply_text("Нет данных по ETF.")
-        return
+            ret = close.iloc[-1] / close.iloc[-days] - 1
+            ret_rel = ret - ret_bench
+            vol = close.pct_change().dropna().std()
+            if not np.isfinite(vol) or vol == 0:
+                continue
 
-    rows.sort(key=lambda x: x[1], reverse=True)
-    top = rows[:n]
-    text = (
-        f"ETF ({uni}) — топ по score = 21д рост − вола (показываю {n}):\n" +
-        "\n".join(
-            f"{i+1:>2}) {t:<6} | score={s:.4f} | 21д={r:.2%} | vol={v:.4f}"
-            for i, (t, s, r, v) in enumerate(top)
-        )
-    )
-    await update.message.reply_text(text)
+            avg21 = float(volm.tail(days).mean())
+            avg60 = float(volm.tail(days * 3).mean())
+            vol_confirm = (avg21 / avg60) if (avg60 and avg60 > 0) else 1.0
 
-# ---------- /mix ----------
-async def mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            score = (ret_rel / vol) * vol_confirm
+            if np.isfinite(score):
+                out[t] = float(score)
+        except Exception as e:
+            log.exception("Ошибка %s: %s", t, e)
+    return out
+
+def _parse_n(args, default=10, minv=3, maxv=50) -> int:
     try:
-        n = int(context.args[0]) if context.args else 10
-    except Exception:
-        n = 10
-    n = max(1, min(n, 30))
+        if args and len(args) > 0:
+            n = int(args[0])
+        else:
+            n = default
+    except:
+        n = default
+    return max(minv, min(maxv, n))
 
-    rows = []
-    universe = HARD_SP500 + ALL_ETF
-    for t in universe:
-        s = fetch_series(t, period="3mo")
-        m = metric_21(s)
-        if not m:
-            continue
-        sc, r, v = m
-        label = "ETF" if t in ALL_ETF else "Акция"
-        rows.append((t, sc, r, v, label))
-
-    if not rows:
-        await update.message.reply_text("Нет данных для смешанного списка.")
-        return
-
-    rows.sort(key=lambda x: x[1], reverse=True)
-    top = rows[:n]
-    text = (
-        f"Смешанный топ {n} (S&P 500 + ETF), сортировка по score:\n" +
-        "\n".join(
-            f"{i+1:>2}) {t:<6} [{lbl}] | score={s:.4f} | 21д={r:.2%} | vol={v:.4f}"
-            for i, (t, s, r, v, lbl) in enumerate(top)
-        )
+# ================== ХЭНДЛЕРЫ =================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Привет! Я AI-рейтинг акций.\n\n"
+        "Команды:\n"
+        "/wake — разбудить/прогреть\n"
+        "/ping — проверить связь\n"
+        "/sp500 [N] — топ N из первых 250 тикеров\n"
+        "/sp5005 | /sp50010 — быстрые пресеты\n"
+        "/etf core|all|x2x3 [N] — рейтинг ETF\n"
+        "/mix [N] — SPX250 + все ETF"
     )
-    await update.message.reply_text(text)
 
-# ========= локальный запуск (polling) =========
-def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN не найден в переменных окружения")
-    app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("sp500", sp500))
-    app.add_handler(CommandHandler("sp5005", sp5005))
-    app.add_handler(CommandHandler("sp50010", sp50010))
-    app.add_handler(CommandHandler("etf", etf))
-    app.add_handler(CommandHandler("mix", mix))
-    logging.info("Starting polling…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
 
+async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        _ = yf.download(BENCH, period="5d", progress=False)
+        await update.message.reply_text("Готов к работе ⚡️")
+    except Exception as e:
+        await update.message.reply_text(f"Wake error: {e}")
+
+async def _rank_and_reply(update: Update, tickers: list[str], n: int, label: str):
+    await update.message.reply_text(f"Считаю рейтинг {label}… (N={n}, D={DAYS})")
+    scores = await tg_app.run_in_executor(None, _calc_scores_for_list, tickers)
+    if not scores:
+        await update.message.reply_text(f"Не удалось получить данные {BENCH}.")
+        return
+    top = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:n]
+    lines = [f"📊 Топ-{n} {label} по score:"]
+    for t, s in top:
+        lines.append(f"{t}: {s:.2f}")
+    await update.message.reply_text("\n".join(lines))
+
+# — S&P 500
+async def cmd_sp500(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = _parse_n(context.args, default=10)
+    await _rank_and_reply(update, SPX250, n, "S&P 500 (первые 250)")
+
+async def cmd_sp5005(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _rank_and_reply(update, SPX250, 5, "S&P 500 (первые 250)")
+
+async def cmd_sp50010(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _rank_and_reply(update, SPX250, 10, "S&P 500 (первые 250)")
+
+# — ETF
+async def cmd_etf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Используй: /etf core|all|x2x3 [N]")
+        return
+    mode = context.args[0].lower()
+    n = _parse_n(context.args[1:], default=10)
+
+    if mode == "core":
+        await _rank_and_reply(update, ETF_CORE, n, "ETF Core")
+    elif mode == "all":
+        await _rank_and_reply(update, ETF_ALL, n, "ETF All")
+    elif mode in ("x2x3", "leveraged"):
+        await _rank_and_reply(update, ETF_X2X3, n, "ETF x2/x3")
+    else:
+        await update.message.reply_text("Неизвестный режим. Используй: core | all | x2x3")
+
+# — MIX
+async def cmd_mix(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = _parse_n(context.args, default=10)
+    combo = SPX250 + ETF_ALL
+    await _rank_and_reply(update, combo, n, "Mix (SPX250 + ETF)")
+
+# ================== ROUTES & BOOT ===========
+# Telegram handlers
+tg_app.add_handler(CommandHandler("start",   cmd_start))
+tg_app.add_handler(CommandHandler("ping",    cmd_ping))
+tg_app.add_handler(CommandHandler("wake",    cmd_wake))
+tg_app.add_handler(CommandHandler("sp500",   cmd_sp500))
+tg_app.add_handler(CommandHandler("sp5005",  cmd_sp5005))
+tg_app.add_handler(CommandHandler("sp50010", cmd_sp50010))
+tg_app.add_handler(CommandHandler("etf",     cmd_etf))
+tg_app.add_handler(CommandHandler("mix",     cmd_mix))
+
+# Flask endpoints
+@app.route("/")
+def root():
+    return "ok"  # healthcheck/wake через браузер
+
+@app.route(f"/webhook/{TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), tg_app.bot)
+    tg_app.update_queue.put_nowait(update)
+    return "ok"
+
+# Entrypoint
 if __name__ == "__main__":
-    main()
+    import asyncio
+    async def main():
+        webhook_url = f"{URL}/webhook/{TOKEN}"
+        await tg_app.initialize()
+        await tg_app.start()
+        await tg_app.bot.delete_webhook(drop_pending_updates=True)
+        await tg_app.bot.set_webhook(webhook_url, allowed_updates=["message"])
+        log.info("Webhook установлен: %s", webhook_url)
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+        )
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
