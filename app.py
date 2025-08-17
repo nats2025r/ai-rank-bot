@@ -1,6 +1,7 @@
 import os
-import logging
+import time
 import asyncio
+import logging
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -18,7 +19,7 @@ log = logging.getLogger("ai-rank-bot")
 # ================== ENV ===================
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-URL   = os.getenv("WEBHOOK_URL")  # например: https://ai-rank-bot-1.onrender.com
+URL   = os.getenv("WEBHOOK_URL")  # напр.: https://ai-rank-bot-1.onrender.com
 if not TOKEN:
     raise RuntimeError("Не найден BOT_TOKEN")
 if not URL:
@@ -33,7 +34,7 @@ DAYS   = 21
 PERIOD = "6mo"
 BENCH  = "SPY"
 
-# ---------- первые ~250 тикеров S&P 500 (зашиты прямо в код) ----------
+# ---------- первые ~250 тикеров S&P 500 (жёстко зашито) ----------
 SPX250 = [
     "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO","JPM","V","UNH","TSLA",
     "XOM","WMT","MA","JNJ","PG","HD","COST","MRK","ADBE","PEP","ABBV","NFLX","CRM","KO","CSCO",
@@ -67,18 +68,38 @@ ETF_CORE = ["SPY","QQQ","DIA","IWM","ARKK","XLF","XLK","XLE"]
 ETF_X2X3 = ["TQQQ","SPXL","UPRO","SOXL","SQQQ","SPXS"]
 ETF_ALL  = ETF_CORE + ETF_X2X3
 
-# ================== ВСПОМОГАТЕЛЬНОЕ =================
+# ================== YF HELPERS (надёжные) ==================
+def _yf_download_safe(tickers, period=PERIOD, group_by="column", auto_adjust=False):
+    """
+    Устойчивая обёртка над yfinance.download:
+    - 3 попытки
+    - threads=False (меньше шанс на ошибки в free-инстансах)
+    """
+    for i in range(3):
+        try:
+            df = yf.download(
+                tickers=tickers,
+                period=period,
+                group_by=group_by,
+                auto_adjust=auto_adjust,
+                progress=False,
+                threads=False,
+            )
+            if df is not None and not df.empty:
+                return df
+            log.warning("yfinance: empty df for %s (try %d)", tickers, i + 1)
+        except Exception as e:
+            log.warning("yfinance error for %s (try %d): %s", tickers, i + 1, e)
+        time.sleep(1 + i * 2)
+    return pd.DataFrame()
+
 def _download_batch(tickers: list[str]) -> pd.DataFrame:
-    data = yf.download(
-        tickers=tickers,
-        period=PERIOD,
-        group_by="column",
-        auto_adjust=False,
-        progress=False,
-        threads=True,
-    )
+    data = _yf_download_safe(tickers=tickers, period=PERIOD, group_by="column", auto_adjust=False)
+    if data.empty:
+        return data
     if isinstance(data.columns, pd.MultiIndex):
         return data
+    # если один тикер — нормализуем к мультииндексу
     data.columns = pd.MultiIndex.from_product([data.columns, [tickers[0]]])
     return data
 
@@ -87,7 +108,7 @@ def _enough(close: pd.Series, days: int) -> bool:
 
 def _calc_scores_for_list(tickers: list[str], benchmark: str = BENCH, days: int = DAYS) -> dict[str, float]:
     data  = _download_batch(tickers)
-    bench = yf.download(benchmark, period=PERIOD, progress=False)
+    bench = _yf_download_safe(benchmark, period=PERIOD)
     if data.empty or bench.empty:
         log.warning("Пустые данные: data.empty=%s bench.empty=%s", data.empty, bench.empty)
         return {}
@@ -136,7 +157,6 @@ def _parse_n(args, default=10, minv=3, maxv=50) -> int:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я AI-рейтинг акций.\n\n"
-        "Команды:\n"
         "/wake — разбудить/прогреть\n"
         "/ping — проверить связь\n"
         "/diag — диагностика\n"
@@ -151,7 +171,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        _ = yf.download(BENCH, period="5d", progress=False, threads=False)
+        _ = _yf_download_safe(BENCH, period="5d")
         await update.message.reply_text("Готов к работе ⚡️")
     except Exception as e:
         await update.message.reply_text(f"Wake error: {e}")
@@ -165,13 +185,9 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wh = f"error: {e}"
         wh_state = "error"
 
-    yf_msg = ""
     try:
-        df = yf.download("SPY", period="5d", progress=False, threads=False)
-        if df.empty:
-            yf_msg = "SPY: пустой DataFrame"
-        else:
-            yf_msg = f"SPY ok, last close={float(df['Close'].dropna().iloc[-1]):.2f}"
+        df = _yf_download_safe("SPY", period="5d")
+        yf_msg = "SPY: пусто" if df.empty else f"SPY ok, last close={float(df['Close'].dropna().iloc[-1]):.2f}"
     except Exception as e:
         yf_msg = f"yfinance exception: {type(e).__name__}: {e}"
 
@@ -180,7 +196,7 @@ async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- webhook_url (env): {os.getenv('WEBHOOK_URL')}\n"
         f"- getWebhookInfo: {wh} [{wh_state}]\n"
         f"- yfinance: {yf_msg}\n"
-        "versions: py, ptb 20.3, flask 2.3.2, yf 0.2.26\n"
+        "versions: ptb 20.3, flask 2.3.2, yf 0.2.26\n"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -244,7 +260,7 @@ tg_app.add_handler(CommandHandler("mix",     cmd_mix))
 # ================== FLASK ROUTES =================
 @app.route("/", methods=["GET"])
 def root():
-    return "ok", 200  # healthcheck
+    return "ok", 200
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -253,7 +269,7 @@ def health():
 @app.route("/wake-http", methods=["GET"])
 def wake_http():
     try:
-        _ = yf.download(BENCH, period="5d", progress=False, threads=False)
+        _ = _yf_download_safe(BENCH, period="5d")
         return "warmed", 200
     except Exception as e:
         return f"wake error: {e}", 500
@@ -264,25 +280,27 @@ def webhook():
     tg_app.update_queue.put_nowait(update)
     return "ok", 200
 
-# ================== ENTRYPOINT =================
+# ================== ENTRYPOINT (waitress) =================
 if __name__ == "__main__":
+    from waitress import serve
+
     async def main():
         webhook_url = f"{URL}/webhook/{TOKEN}"
 
-        # запустить PTB
+        # 1) Telegram bot
         await tg_app.initialize()
         await tg_app.start()
 
-        # настроить вебхук
+        # 2) Webhook
         await tg_app.bot.delete_webhook(drop_pending_updates=True)
         await tg_app.bot.set_webhook(webhook_url, allowed_updates=["message"])
         log.info("Webhook установлен: %s", webhook_url)
 
-        # запустить Flask (блокирующий) в отдельном потоке
+        # 3) HTTP server (sync) in executor
+        port = int(os.environ.get("PORT", 8080))
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
-        )
+        log.info("Starting HTTP on 0.0.0.0:%d (waitress)...", port)
+        await loop.run_in_executor(None, lambda: serve(app, host="0.0.0.0", port=port))
 
     try:
         asyncio.run(main())
