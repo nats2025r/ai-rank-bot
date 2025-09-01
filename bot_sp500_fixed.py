@@ -1,9 +1,11 @@
 # bot_sp500_fixed.py
 # Telegram-бот: AI-моментум + ConfirmScore для SP250/ETFALL/ETFX
+# Устойчивый к ошибкам yfinance (батчи + ретраи), тяжёлые расчёты в фон-потоке.
 # Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4
 
 import os
 import math
+import time
 import asyncio
 from datetime import datetime, timezone
 import numpy as np
@@ -15,7 +17,7 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ────────────────────────────────────────────────────────────────────────────────
-# ENV (можно задать в Render → Environment)
+# ENV (Render → Environment)
 # ────────────────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 AI_CSV_URL = os.getenv("AI_CSV_URL", "none").strip()        # "none" или URL CSV: ticker,ai_score
@@ -24,7 +26,7 @@ BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
 BENCH_MODE = os.getenv("BENCH_MODE", "global").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
-# Кандидаты бенчмарков для SMART-режима (корреляционный выбор по тикеру)
+# Кандидаты бенчмарков для SMART-режима
 BENCH_CANDIDATES = [
     "SPY","QQQ","IWM","DIA",
     "XLK","XLV","XLF","XLY","XLI","XLC","XLP","XLE","XLU","XLB","XLRE"
@@ -32,9 +34,6 @@ BENCH_CANDIDATES = [
 
 # ────────────────────────────────────────────────────────────────────────────────
 # === UNIVERSES ===
-# SP250  — фиксированный список акций (S&P 500 Top-250 по весу)
-# ETFALL — 50 обычных ETF (без плеча/инверса)
-# ETFX   — расширенный список (плечевые/инверсные/спец)
 # ────────────────────────────────────────────────────────────────────────────────
 
 SP250 = [
@@ -86,45 +85,27 @@ ETFALL = [
     "VNQ",
     # Commodities / tips
     "GLD","IAU","TIP",
-    # Added populars
+    # Popular adds
     "BITO","LIT","RSP","MAGS"
 ]
 
 ETFX = [
-    # QQQ 3x / -3x
     "TQQQ","SQQQ",
-    # Semis 3x / -3x
     "SOXL","SOXS",
-    # S&P500 3x / -3x
     "SPXL","SPXS","UPRO","SPXU",
-    # Tech 3x / -3x
     "TECL","TECS","WEBL","WEBS",
-    # Russell 2000 3x / -3x
     "TNA","TZA",
-    # Biotech 3x / -3x
     "LABU","LABD",
-    # Financials 3x / -3x
     "FAS","FAZ",
-    # Energy 2x / -2x
     "ERX","ERY",
-    # Oil 2x / -2x
     "UCO","SCO",
-    # Natural Gas 2x / -2x
     "BOIL","KOLD",
-    # QQQ 2x / -2x
     "QLD","QID",
-    # 20+Y Treasuries 3x / -3x
     "TMF","TMV",
-    # Gold miners bull/bear
     "NUGT","DUST",
-    # Tech single-stock (Tesla) 1.5x/-1.5x (proxy via TSLL/TSLS)
     "TSLL","TSLS",
-    # Dow 3x bull/bear
     "UDOW","SDOW",
-    # Semiconductors bear alt, etc.
-    # Special/crypto
     "BITX",
-    # Utilities 2x bear (proxy) — пара к USD
     "USD","SSG"
 ]
 
@@ -151,57 +132,90 @@ def _atr(h: pd.Series, l: pd.Series, c: pd.Series, n: int = 20) -> pd.Series:
     ], axis=1).max(axis=1)
     return tr.rolling(n).mean()
 
-def load_ai_scores_csv(url: str):
-    if not url or url.lower() == "none":
-        return None
-    import pandas as pd
-    df = pd.read_csv(url)
-    # нормализуем названия
-    df = df.rename(columns={c: c.strip().lower() for c in df.columns})
-    if "ticker" not in df.columns or "ai_score" not in df.columns:
-        raise ValueError("AI CSV must have columns: ticker, ai_score")
-    df["ticker"] = (
-        df["ticker"].astype(str).str.upper()
-        .str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
-    )
-    return {row.ticker: float(row.ai_score) for row in df.itertuples(index=False)}
+# Устойчивый загрузчик с ретраями
+def yf_download_safe(tickers, **kwargs):
+    for attempt in range(3):
+        try:
+            return yf.download(tickers, **kwargs)
+        except Exception:
+            time.sleep(1.5 * (attempt + 1))
+    try:
+        if isinstance(tickers, (list, tuple)):
+            dfs = []
+            for t in tickers:
+                try:
+                    df1 = yf.download(t, **kwargs)
+                    if not df1.empty:
+                        dfs.append(df1)
+                except Exception:
+                    pass
+            if dfs:
+                return pd.concat(dfs, axis=1)
+    except Exception:
+        pass
+    return pd.DataFrame()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Market data & features
+# Market data & features (устойчивые)
 # ────────────────────────────────────────────────────────────────────────────────
-
 def fetch_features(tickers: list[str]) -> pd.DataFrame:
     """
+    Стабильная загрузка: батчами по 30 тикеров, без лишних потоков.
     Возвращает MultiIndex (date, ticker) с колонками:
     close, high, low, volume, adv20, atr20, volRel, mom, ret21
     """
-    # Берём ~400 дней, чтобы хватило на 252д high и 200д MA
-    data = yf.download(
-        tickers,
-        period="430d",
-        interval="1d",
-        auto_adjust=True,
-        group_by="ticker",
-        threads=True,
-        progress=False,
-    )
-
-    frames = []
-    if isinstance(data.columns, pd.MultiIndex):
-        # по каждому тикеру
-        for t in tickers:
-            if t not in data.columns.get_level_values(0):
-                continue
-            df = data[t].rename(columns=str.lower)
+    def _one_batch(batch: list[str]) -> list[pd.DataFrame]:
+        data = yf_download_safe(
+            batch,
+            period="430d",
+            interval="1d",
+            auto_adjust=True,
+            group_by="ticker",
+            threads=False,
+            progress=False,
+        )
+        frames = []
+        if isinstance(data.columns, pd.MultiIndex):
+            for t in batch:
+                if t not in data.columns.get_level_values(0):
+                    continue
+                df = data[t]
+                df.columns = [c.lower() for c in df.columns]
+                if not {"close","high","low","volume"}.issubset(df.columns):
+                    continue
+                df = df.dropna(subset=["close"])
+                if df.empty:
+                    continue
+                atr20 = _atr(df["high"], df["low"], df["close"], 20)
+                adv20 = (df["close"] * df["volume"]).rolling(20).mean()
+                volRel = atr20 / df["close"]
+                c = df["close"]
+                ret126 = c.pct_change(126)
+                ret21 = c.pct_change(21)
+                mom = ret126 - ret21
+                out = pd.DataFrame({
+                    "ticker": t,
+                    "close": df["close"],
+                    "high": df["high"],
+                    "low": df["low"],
+                    "volume": df["volume"],
+                    "adv20": adv20,
+                    "atr20": atr20,
+                    "volRel": volRel,
+                    "mom": mom,
+                    "ret21": (1 + c.pct_change()).rolling(21).apply(np.prod, raw=True) - 1.0
+                })
+                frames.append(out)
+        else:
+            if data.empty:
+                return []
+            df = data.rename(columns=str.lower)
+            t = batch[0]
             if not {"close","high","low","volume"}.issubset(df.columns):
-                continue
-            df = df.dropna(subset=["close"])
-            if df.empty:
-                continue
+                return []
             atr20 = _atr(df["high"], df["low"], df["close"], 20)
             adv20 = (df["close"] * df["volume"]).rolling(20).mean()
             volRel = atr20 / df["close"]
-            # Моментум 6м-1м (примерно 126д и 21д)
             c = df["close"]
             ret126 = c.pct_change(126)
             ret21 = c.pct_change(21)
@@ -219,39 +233,36 @@ def fetch_features(tickers: list[str]) -> pd.DataFrame:
                 "ret21": (1 + c.pct_change()).rolling(21).apply(np.prod, raw=True) - 1.0
             })
             frames.append(out)
-    else:
-        # единичный тикер
-        df = data.rename(columns=str.lower)
-        t = tickers[0]
-        atr20 = _atr(df["high"], df["low"], df["close"], 20)
-        adv20 = (df["close"] * df["volume"]).rolling(20).mean()
-        volRel = atr20 / df["close"]
-        c = df["close"]
-        ret126 = c.pct_change(126)
-        ret21 = c.pct_change(21)
-        mom = ret126 - ret21
-        out = pd.DataFrame({
-            "ticker": t,
-            "close": df["close"],
-            "high": df["high"],
-            "low": df["low"],
-            "volume": df["volume"],
-            "adv20": adv20,
-            "atr20": atr20,
-            "volRel": volRel,
-            "mom": mom,
-            "ret21": (1 + c.pct_change()).rolling(21).apply(np.prod, raw=True) - 1.0
-        })
-        frames.append(out)
+        return frames
 
-    if not frames:
-        return pd.DataFrame(columns=["ticker","close","high","low","volume","adv20","atr20","volRel","mom","ret21"]).set_index(["ticker"])
+    frames_all: list[pd.DataFrame] = []
+    BATCH = 30
+    for i in range(0, len(tickers), BATCH):
+        batch = tickers[i:i+BATCH]
+        try:
+            frames_all.extend(_one_batch(batch))
+        except Exception:
+            continue
 
-    df_all = pd.concat(frames)
+    if not frames_all:
+        mi = pd.MultiIndex.from_arrays([[], []], names=["date","ticker"])
+        return pd.DataFrame(columns=["close","high","low","volume","adv20","atr20","volRel","mom","ret21"], index=mi)
+
+    df_all = pd.concat(frames_all)
     df_all = df_all.reset_index().rename(columns={"index":"date"})
     df_all["date"] = pd.to_datetime(df_all["date"])
     df_all = df_all.set_index(["date","ticker"]).sort_index()
     return df_all
+
+def load_ai_scores_csv(url: str):
+    if not url or url.lower() == "none":
+        return None
+    df = pd.read_csv(url)
+    df = df.rename(columns={c: c.strip().lower() for c in df.columns})
+    if "ticker" not in df.columns or "ai_score" not in df.columns:
+        raise ValueError("AI CSV must have columns: ticker, ai_score")
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.replace(".", "-", regex=False)
+    return {row.ticker: float(row.ai_score) for row in df.itertuples(index=False)}
 
 def compute_score_snap(feats: pd.DataFrame, ai_map: dict | None = None, w_ai: float = 0.0) -> pd.DataFrame:
     last_date = feats.index.get_level_values(0).max()
@@ -346,17 +357,23 @@ def _up_down_vol_ratio(close: pd.Series, volume: pd.Series, n: int = 20) -> floa
 
 def fetch_benchmark_series(tickers: list[str], period: str = "220d") -> dict[str, pd.Series]:
     out = {}
-    data = yf.download(tickers, period=period, interval="1d", auto_adjust=True, group_by="ticker", threads=True, progress=False)
-    if isinstance(data.columns, pd.MultiIndex):
-        for t in tickers:
-            if t in data.columns.get_level_values(0):
-                s = data[t]["Close"].dropna()
-                s.name = t
+    for t in tickers:
+        try:
+            data = yf_download_safe([t], period=period, interval="1d",
+                                    auto_adjust=True, group_by="ticker",
+                                    threads=False, progress=False)
+            if isinstance(data.columns, pd.MultiIndex):
+                if t in data.columns.get_level_values(0):
+                    s = data[t]["Close"].dropna()
+                else:
+                    s = pd.Series(dtype=float)
+            else:
+                s = data["Close"].dropna() if "Close" in data.columns else pd.Series(dtype=float)
+            s.name = t
+            if not s.empty:
                 out[t] = s
-    else:
-        s = data["Close"].dropna()
-        s.name = tickers[0]
-        out[tickers[0]] = s
+        except Exception:
+            pass
     return out
 
 def pick_best_benchmark(close: pd.Series, bench_map: dict[str, pd.Series]) -> str:
@@ -375,10 +392,6 @@ def pick_best_benchmark(close: pd.Series, bench_map: dict[str, pd.Series]) -> st
     return best_t or BENCH_DEFAULT
 
 def compute_confirm_metrics(feats: pd.DataFrame, bench_close_or_map, today: pd.Timestamp | None = None) -> pd.DataFrame:
-    """
-    feats: MultiIndex (date,ticker) с колонками close, high, low, volume, adv20
-    bench_close_or_map: Series (глобальный бенч) или dict[ticker->Series] (SMART)
-    """
     last_date = feats.index.get_level_values(0).max() if today is None else today
     out_rows = []
 
@@ -394,7 +407,6 @@ def compute_confirm_metrics(feats: pd.DataFrame, bench_close_or_map, today: pd.T
             continue
         c, h, l, v = df["close"], df["high"], df["low"], df["volume"]
 
-        # Cum returns
         ret = c.pct_change()
         ret21 = (ret+1).rolling(21).apply(np.prod, raw=True).iloc[-1] - 1.0
         ret63 = (ret+1).rolling(63).apply(np.prod, raw=True).iloc[-1] - 1.0
@@ -410,28 +422,23 @@ def compute_confirm_metrics(feats: pd.DataFrame, bench_close_or_map, today: pd.T
             alpha63 = ret63 - (b63 if np.isfinite(b63) else 0.0)
             bench_t = getattr(bench_s, "name", None)
 
-        # MAs
         sma20 = c.rolling(20).mean().iloc[-1]
         sma50 = c.rolling(50).mean().iloc[-1]
         sma200 = c.rolling(200).mean().iloc[-1]
         lastc = c.iloc[-1]
         ma_ok = (lastc > sma50 > sma200) and (sma20 > sma50)
 
-        # ADX14
         adx14 = _adx(h, l, c, 14).iloc[-1]
 
-        # RS (price/bench) линрег-наклон и R^2
         _b = bench_s
         rs = (c / _b.reindex_like(c, method="ffill")).dropna() if _b is not None else (c / c).dropna()
         slope_rs, r2_rs = _linreg_slope_r2(rs.tail(60))
         rs_ok = (slope_rs > 0) and (r2_rs >= 0.2)
 
-        # 52w proximity
         hhv252 = c.rolling(252).max().iloc[-1]
         dist52w = lastc/hhv252 - 1.0 if hhv252 and np.isfinite(hhv252) else np.nan
         prox_ok = (-0.02 <= dist52w <= 0.05)
 
-        # Volume confirmation (Up/Down + breakout w/expansion)
         ud_ratio = _up_down_vol_ratio(c, v, 20)
         recent = df.tail(5)
         recent20h = recent["close"] >= df["close"].rolling(20).max().reindex(recent.index)
@@ -439,13 +446,11 @@ def compute_confirm_metrics(feats: pd.DataFrame, bench_close_or_map, today: pd.T
         breakout_ok = bool((recent20h & vol_exp).any())
         vol_ok = (ud_ratio >= 1.2) and breakout_ok
 
-        # Volatility compression & DD
         hv20 = _hv(c, 20); hv60 = _hv(c, 60)
         hv_ok = (np.isfinite(hv20) and np.isfinite(hv60) and hv60 > 0 and (hv20/hv60) <= 0.8)
         dd63 = _max_drawdown(c, 63)
         dd_ok = (dd63 >= -0.15) if np.isfinite(dd63) else False
 
-        # Distance to SMA20
         dist_sma20 = (lastc/sma20 - 1.0) if sma20 else np.nan
         dist_ok = (0.0 <= dist_sma20 <= 0.08) if np.isfinite(dist_sma20) else False
 
@@ -520,7 +525,9 @@ async def sp500_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         topn = 10
 
-    feats = fetch_features(SP250)
+    await update.message.reply_text("Считаю SP250… это ~20–30 сек на первом запуске.")
+    feats = await asyncio.to_thread(fetch_features, SP250)
+
     ai_map = load_ai_scores_csv(AI_CSV_URL) if (AI_CSV_URL and AI_CSV_URL.lower() != "none") else None
     snap = compute_score_snap(feats, ai_map=ai_map, w_ai=W_AI)
 
@@ -537,11 +544,10 @@ async def sp500_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bench_obj = per_t_bench
         bench_label = "SMART"
     else:
-        b = fetch_benchmark_series([BENCH_DEFAULT], period="220d")[BENCH_DEFAULT]
+        b = fetch_benchmark_series([BENCH_DEFAULT], period="220d").get(BENCH_DEFAULT, pd.Series(dtype=float))
         bench_obj = b
         bench_label = BENCH_DEFAULT
 
-    # Confirm & RS
     confirm_df = compute_confirm_metrics(feats, bench_obj)
     merged = snap.merge(confirm_df, on="ticker", how="left")
     merged = merged[(merged["alpha21"] > 0) & (merged["alpha63"] > 0)]
@@ -585,14 +591,16 @@ async def sp50010_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ETF рейтинги
 async def etfall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    feats = fetch_features(ETFALL)
+    await update.message.reply_text("Считаю ETFALL…")
+    feats = await asyncio.to_thread(fetch_features, ETFALL)
     ai_map = load_ai_scores_csv(AI_CSV_URL) if (AI_CSV_URL and AI_CSV_URL.lower() != "none") else None
     snap = compute_score_snap(feats, ai_map=ai_map, w_ai=W_AI).sort_values("score", ascending=False)
     text = format_simple_list(snap, "ETF", "ETFALL топ 10", 10)
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    feats = fetch_features(ETFX)
+    await update.message.reply_text("Считаю ETFX…")
+    feats = await asyncio.to_thread(fetch_features, ETFX)
     ai_map = load_ai_scores_csv(AI_CSV_URL) if (AI_CSV_URL and AI_CSV_URL.lower() != "none") else None
     snap = compute_score_snap(feats, ai_map=ai_map, w_ai=W_AI).sort_values("score", ascending=False)
     text = format_simple_list(snap, "ETF", "ETFX топ 10", 10)
@@ -613,7 +621,9 @@ async def etf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         tickers = ETFALL
         label = "etfall"
-    feats = fetch_features(tickers)
+
+    await update.message.reply_text(f"Считаю ETF ({label})…")
+    feats = await asyncio.to_thread(fetch_features, tickers)
     ai_map = load_ai_scores_csv(AI_CSV_URL) if (AI_CSV_URL and AI_CSV_URL.lower() != "none") else None
     snap = compute_score_snap(feats, ai_map=ai_map, w_ai=W_AI).sort_values("score", ascending=False)
     text = format_simple_list(snap, "ETF", f"ETF рейтинг ({label})", min(20, len(snap)))
@@ -676,7 +686,11 @@ def main() -> None:
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # базовые
+    app.add_handler(CommandHandler("start", ping_cmd))
     app.add_handler(CommandHandler("ping", ping_cmd))
+
+    # акции / ETF
     app.add_handler(CommandHandler("sp500", sp500_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
     app.add_handler(CommandHandler("sp50010", sp50010_cmd))
@@ -684,9 +698,9 @@ def main() -> None:
     app.add_handler(CommandHandler("etfx", etfx_cmd))
     app.add_handler(CommandHandler("etf", etf_cmd))
 
+    # настройки
     app.add_handler(CommandHandler("setaisource", setaisource_cmd))
     app.add_handler(CommandHandler("setw_ai", setw_ai_cmd))
-
     app.add_handler(CommandHandler("setbenchmark", setbenchmark_cmd))
     app.add_handler(CommandHandler("benchmode", benchmode_cmd))
     app.add_handler(CommandHandler("benchcandidates", benchcandidates_cmd))
@@ -696,4 +710,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
