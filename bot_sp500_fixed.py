@@ -5,7 +5,7 @@
 import os
 import math
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -15,56 +15,79 @@ import requests
 
 # telegram-bot
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# -------------------- ENV (можно задать в Render) --------------------
+# -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-AI_CSV_URL = os.getenv("AI_CSV_URL", "none").strip()      # "none" или URL CSV: ticker,ai_score
-W_AI = float(os.getenv("W_AI", "0.0"))                    # 0..1 — вес AI в композите
+AI_CSV_URL = os.getenv("AI_CSV_URL", "none").strip()
+W_AI = float(os.getenv("W_AI", "0.0"))
 BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
 BENCH_MODE = os.getenv("BENCH_MODE", "global").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
-# Кандидаты бенчмарков для SMART-режима (корреляционный выбор по тикеру)
 BENCH_CANDIDATES = [
     "SPY","QQQ","IWM","DIA",
     "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
 ]
 
-# -------------------- Надёжная загрузка цен (patch) --------------------
+# -------------------- Надёжная загрузка цен --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
-# при желании можно подменять «капризные» тикеры на аналоги
+# единая сессия с User-Agent — уменьшает шанс пустых ответов Yahoo
+YF_SESSION = requests.Session()
+YF_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+})
+
 ALIAS = {
-    # "BITX": "BITB",     # если BITX не отдаёт историю у Yahoo — можно сменить на доступный аналог
-    # "USD": "USD",       # ProShares Ultra Semiconductors — в Yahoo есть "USD"
+    # "BITX": "BITB",
+    # "USD": "USD",
 }
 
-def _fetch_one_close(ticker: str) -> pd.Series | None:
-    t = ALIAS.get(ticker, ticker)
-    try:
-        df = yf.download(t, **YF_OPTS)
-        if df is None or len(df) == 0:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            # ('Close','TICKER') → берём Close
-            if 'Close' in df.columns.get_level_values(0):
-                s = df['Close']
-                if isinstance(s, pd.DataFrame):
-                    if t in s.columns:
-                        s = s[t]
-                    else:
-                        s = s.iloc[:, 0]
-                return s.rename(ticker)
-            return None
-        else:
-            if 'Close' not in df.columns:
-                return None
-            return df['Close'].rename(ticker)
-    except Exception as e:
-        print(f"[yfinance] fail {ticker}: {e}")
+def _normalize_yf_df(df, ticker: str) -> pd.Series | None:
+    if df is None or len(df) == 0:
         return None
+    if isinstance(df.columns, pd.MultiIndex):
+        if 'Close' in df.columns.get_level_values(0):
+            s = df['Close']
+            if isinstance(s, pd.DataFrame):
+                if ticker in s.columns:
+                    s = s[ticker]
+                else:
+                    s = s.iloc[:, 0]
+            return s.rename(ticker)
+        return None
+    else:
+        if 'Close' not in df.columns:
+            return None
+        return df['Close'].rename(ticker)
+
+def _fetch_one_close(ticker: str) -> pd.Series | None:
+    """Загрузка цены с fallback и общей сессией."""
+    t = ALIAS.get(ticker, ticker)
+    # 1-я попытка: как задано в YF_OPTS
+    try:
+        df = yf.download(t, session=YF_SESSION, **YF_OPTS)
+        s = _normalize_yf_df(df, t)
+        if s is not None and not s.dropna().empty:
+            return s.rename(ticker)
+    except Exception as e:
+        print(f"[yfinance] fail {ticker} (1st): {e}")
+
+    # 2-я попытка: подлиннее период
+    try:
+        alt = dict(YF_OPTS)
+        alt["period"] = "365d"
+        df = yf.download(t, session=YF_SESSION, **alt)
+        s = _normalize_yf_df(df, t)
+        if s is not None and not s.dropna().empty:
+            return s.rename(ticker)
+    except Exception as e:
+        print(f"[yfinance] fail {ticker} (2nd): {e}")
+
+    # не удалось
+    return None
 
 async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]]:
     data = []
@@ -93,7 +116,6 @@ def pct_change(series: pd.Series, periods: int) -> float:
     return b / a - 1.0
 
 def confirm_score(pr: pd.Series) -> float:
-    """Простой подтверждающий сигнал: сколько МА (50/100/150/200) цена сейчас выше."""
     if len(pr) < 200:
         return 0.0
     close = pr.iloc[-1]
@@ -105,13 +127,12 @@ def confirm_score(pr: pd.Series) -> float:
     for ma in (ma50, ma100, ma150, ma200):
         if close > ma:
             score += 1
-    return score / 4.0  # 0..1
+    return score / 4.0
 
 def rank_pct(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
-    """SMART: выбираем бенчмарк с макс. корреляцией за 180d из BENCH_CANDIDATES."""
     candidates = [b for b in BENCH_CANDIDATES if b in closes.columns]
     if not candidates:
         return BENCH_DEFAULT
@@ -126,7 +147,7 @@ def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
             best = b
     return best
 
-def load_ai_scores() -> dict[str,float]:
+def load_ai_scores() -> dict[str, float]:
     if not AI_CSV_URL or AI_CSV_URL.lower() == "none":
         return {}
     try:
@@ -137,8 +158,7 @@ def load_ai_scores() -> dict[str,float]:
             if len(parts) >= 2:
                 tk = parts[0].upper()
                 try:
-                    val = float(parts[1])
-                    out[tk] = val
+                    val = float(parts[1]); out[tk] = val
                 except:
                     pass
         return out
@@ -147,18 +167,15 @@ def load_ai_scores() -> dict[str,float]:
         return {}
 
 def composite_score(rs21_rel: pd.Series, rs63_rel: pd.Series, conf: pd.Series, ai: dict[str,float]) -> pd.Series:
-    # нормируем на [0..1] ранжированием
     r1 = rank_pct(rs21_rel.fillna(-1))
     r2 = rank_pct(rs63_rel.fillna(-1))
     rc = conf.fillna(0)
     base = 0.45*r1 + 0.35*r2 + 0.20*rc
     if not ai or W_AI <= 0:
         return base
-    # ai нормируем по вселенной
     ai_series = pd.Series({k:v for k,v in ai.items() if k in base.index})
     if not ai_series.empty:
         ai_norm = rank_pct(ai_series)
-        # совмещаем
         base.loc[ai_norm.index] = (1.0 - W_AI)*base.loc[ai_norm.index] + W_AI*ai_norm
     return base
 
@@ -167,44 +184,37 @@ def fmt_row(i, tk, row):
 
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: list[str], top_n: int | None):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
-    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
     use_tickers = sorted(set([t.upper() for t in tickers] + list(bench_need)))
 
-    closes, bad = await load_close_matrix(use_tickers)
+    # ключевой try/except — вместо падения дадим понятный ответ
+    try:
+        closes, bad = await load_close_matrix(use_tickers)
+    except Exception as e:
+        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo). Попробуй ещё раз чуть позже.\nДетали: {e}")
+        return
+
     missing = [t for t in tickers if t not in closes.columns]
     bad_all = sorted(set(bad + missing))
     if bad_all:
         await update.message.reply_text("⚠️ Пропущены тикеры без истории: " + ", ".join(bad_all))
 
-    # реальная вселенная — только то, что загрузилось
     uni = [t for t in tickers if t in closes.columns]
     if not uni:
         await update.message.reply_text("Нечего ранжировать: нет данных по вселенной.")
         return
 
-    # AI
     ai = load_ai_scores() if W_AI > 0 else {}
-
-    # считаем метрики
     rows = []
     for tk in uni:
         pr = closes[tk].dropna()
         if pr.empty:
             continue
-
-        # выбор бенчмарка
-        if BENCH_MODE == "smart":
-            bench = pick_benchmark_for(tk, closes)
-        else:
-            bench = BENCH_DEFAULT
-
+        bench = pick_benchmark_for(tk, closes) if BENCH_MODE == "smart" else BENCH_DEFAULT
         if bench not in closes.columns:
             bench = BENCH_DEFAULT
-
-        # относительные доходности
         rs21 = pct_change(pr, 21)
         rs63 = pct_change(pr, 63)
         if bench in closes.columns:
@@ -217,14 +227,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             rs21_rel, rs63_rel = rs21, rs63
 
         conf = confirm_score(pr)
-
-        rows.append({
-            "ticker": tk,
-            "bench": bench,
-            "rs21_rel": rs21_rel,
-            "rs63_rel": rs63_rel,
-            "conf": conf,
-        })
+        rows.append({"ticker": tk, "bench": bench, "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf})
 
     df = pd.DataFrame(rows).set_index("ticker")
     if df.empty:
@@ -239,62 +242,38 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         lines = [f"Топ {top_n} — {universe_name}, сортировка по score:"]
         for i, (tk, row) in enumerate(df_show.iterrows(), 1):
             lines.append(fmt_row(i, tk, row))
-        text = "\n".join(lines)
-        await update.message.reply_text(text)
+        await update.message.reply_text("\n".join(lines))
     else:
-        # полный рейтинг (батчами чтобы не упереться в лимиты Telegram)
-        header = f"Полный рейтинг {universe_name}, сортировка по score:"
-        await update.message.reply_text(header)
+        await update.message.reply_text(f"Полный рейтинг {universe_name}, сортировка по score:")
         chunk = []
         for i, (tk, row) in enumerate(df_sorted.iterrows(), 1):
             chunk.append(fmt_row(i, tk, row))
             if len(chunk) == 30:
-                await update.message.reply_text("\n".join(chunk))
-                chunk = []
+                await update.message.reply_text("\n".join(chunk)); chunk = []
         if chunk:
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-# SP250: фиксированный список (топ ~250 S&P 500 по весу; можно обновлять от времени к времени).
-# Если хочешь — просто замени список ниже на свой (одной строкой).
 SP250 = """
-NVDA MSFT AAPL AMZN GOOGL GOOG BRK.B META TSLA AVGO LLY JPM UNH V MA XOM JNJ PG ORCL CVX MRK COST ABBV KO PEP BAC WMT NFLX ADBE CRM CSCO TMO ACN MCD AMD WFC DHR LIN ABT TXN IBM PM CAT COP NKE AMAT MDT HON UPS QCOM LMT MS BKNG LOW GE BMY SPGI T AMGN RTX C GS NOW SBUX GILD DE ADP INTU MU CHTR ELV MMC MDLZ PLD BLK ISRG ZTS ADI TGT REGN CB PGR SYK SO EOG HCA PANW KLAC BSX TJX CME MCO USB EQIX PXD AON FI AXP OXY SHW ITW NOC CDW LRCX PEP^ QQQ^  # (заметка: можно дополнять списком; главное — валидные тикеры)
+NVDA MSFT AAPL AMZN GOOGL GOOG BRK.B META TSLA AVGO LLY JPM UNH V MA XOM JNJ PG ORCL CVX MRK COST ABBV KO PEP BAC WMT NFLX ADBE CRM CSCO TMO ACN MCD AMD WFC DHR LIN ABT TXN IBM PM CAT COP NKE AMAT MDT HON UPS QCOM LMT MS BKNG LOW GE BMY SPGI T AMGN RTX C GS NOW SBUX GILD DE ADP INTU MU CHTR ELV MMC MDLZ PLD BLK ISRG ZTS ADI TGT REGN CB PGR SYK SO EOG HCA PANW KLAC BSX TJX CME MCO USB EQIX PXD AON FI AXP OXY SHW ITW NOC CDW LRCX PEP^ QQQ^
 """.split()
 
-# ↑ ПРИМЕЧАНИЕ:
-# 1) Список здесь укорочен, чтобы код поместился в одно сообщение.
-# 2) Бот будет работать и с этим списком. Когда захочешь — просто вставь свои точные 250 тикеров.
-# 3) Тикеры должны быть через пробел.
-
-# ETFALL — 50 обычных (без плеча/инверса), ликвидные и крупные
 ETFALL = [
-    # broad market / стилевые
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
-    # секторные SPDR
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
-    # облигации/кредит
     "TLT","IEF","HYG","LQD","AGG","BND",
-    # сырьё / золото / серебро
     "GLD","IAU","SLV","GDX",
-    # факторные/нишевые
     "SMH","SOXX","IBB","XBI","ITB","XHB","IYT","XOP","XME","XRT",
-    # «популярные»
     "BITO","LIT","MAGS","ARKK","KRE","KBE",
 ]
 
-# ETFX — плечевые/инверсные/одиночные (≈27–30 шт)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
     "LABU","LABD","TNA","TZA",
     "UCO","SCO","BOIL","KOLD",
     "NUGT","DUST",
-    "UVXY",          # вола (ETN/ETF) — иногда полезно, но котировки бывают «особенные»
-    "TSLL",          # Tesla 1.5x long
-    "WEBL",          # интернет 3x long
-    "UPRO",          # ещё раз — пусть остаётся в списке
-    "USD",           # ProShares Ultra Semiconductors (2x)
-    "BITX",          # по твоей просьбе — если не отдаёт историю, подменим через ALIAS
+    "UVXY","TSLL","WEBL","UPRO","USD","BITX",
 ]
 
 # -------------------- КОМАНДЫ --------------------
@@ -316,18 +295,14 @@ async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFX", ETFX, top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /etf  или /etf etfall|etfx
     args = [a.lower() for a in context.args] if context.args else []
-    name = "etfall"
-    tickers = ETFALL
-    if args:
-        if args[0] in ("etfall","etfx"):
-            name = args[0]
+    name = "etfall"; tickers = ETFALL
+    if args and args[0] in ("etfall","etfx"):
+        name = args[0]
     if name == "etfx":
         tickers = ETFX
     await universe_rank(update, context, name.upper(), tickers, top_n=None)
 
-# настройки
 async def benchmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BENCH_MODE
     if context.args:
@@ -368,19 +343,18 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float(context.args[0])
         if 0.0 <= val <= 1.0:
-            W_AI = val
-            await update.message.reply_text(f"W_AI = {W_AI}")
+            W_AI = val; await update.message.reply_text(f"W_AI = {W_AI}")
         else:
             await update.message.reply_text("Допустимо 0..1")
     except:
         await update.message.reply_text("Не понял число. Пример: /setw_ai 0.2")
 
-# -------------------- ИНИЦИАЛИЗАЦИЯ: снять webhook перед polling --------------------
+# -------------------- ИНИЦИАЛИЗАЦИЯ: снять webhook --------------------
 async def _post_init(app: Application):
-    """На всякий случай снимаем webhook, чтобы polling не конфликтовал."""
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        print("[init] webhook deleted (if it existed).")
+        me = await app.bot.get_me()
+        print(f"[init] webhook cleared. Bot: @{me.username} (id={me.id})")
     except Exception as e:
         print(f"[init] delete_webhook error: {e}")
 
@@ -388,14 +362,7 @@ async def _post_init(app: Application):
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN env var.")
-
-    # подключаем post_init, НИЧЕГО не меняя в бизнес-логике
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(_post_init)
-        .build()
-    )
+    app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
 
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
@@ -415,3 +382,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+-
