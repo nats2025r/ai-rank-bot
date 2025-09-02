@@ -7,7 +7,6 @@ import math
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
-
 from typing import Optional, List, Tuple, Dict
 
 import numpy as np
@@ -18,6 +17,7 @@ import requests
 # telegram-bot
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.request import HTTPXRequest  # <- добавили
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -252,8 +252,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         for i, (tk, row) in enumerate(df_sorted.iterrows(), 1):
             chunk.append(fmt_row(i, tk, row))
             if len(chunk) == 30:
-                await update.message.reply_text("\n".join(chunk))
-                chunk = []
+                await update.message.reply_text("\n".join(chunk)); chunk = []
         if chunk:
             await update.message.reply_text("\n".join(chunk))
 
@@ -366,7 +365,22 @@ async def _post_init(app: Application):
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN env var.")
-    app = (Application.builder().token(BOT_TOKEN).post_init(_post_init).build())
+
+    # увеличиваем таймауты клиента Telegram (решает TimedOut)
+    request = HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=60.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(_post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
@@ -386,3 +400,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
