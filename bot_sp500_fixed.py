@@ -375,11 +375,27 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Не понял число. Пример: /setw_ai 0.2")
 
+# -------------------- ИНИЦИАЛИЗАЦИЯ: снять webhook перед polling --------------------
+async def _post_init(app: Application):
+    """На всякий случай снимаем webhook, чтобы polling не конфликтовал."""
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("[init] webhook deleted (if it existed).")
+    except Exception as e:
+        print(f"[init] delete_webhook error: {e}")
+
 # -------------------- MAIN --------------------
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN env var.")
-    app = Application.builder().token(BOT_TOKEN).build()
+
+    # подключаем post_init, НИЧЕГО не меняя в бизнес-логике
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
