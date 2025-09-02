@@ -8,6 +8,8 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from typing import Optional, List, Tuple, Dict
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -33,19 +35,20 @@ BENCH_CANDIDATES = [
 # -------------------- Надёжная загрузка цен --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
-# единая сессия с User-Agent — уменьшает шанс пустых ответов Yahoo
+# Единая requests-сессия с User-Agent — уменьшает шанс пустых ответов Yahoo
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 })
 
-ALIAS = {
+# при желании можно подменять «капризные» тикеры на аналоги
+ALIAS: Dict[str, str] = {
     # "BITX": "BITB",
     # "USD": "USD",
 }
 
-def _normalize_yf_df(df, ticker: str) -> pd.Series | None:
+def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
     if df is None or len(df) == 0:
         return None
     if isinstance(df.columns, pd.MultiIndex):
@@ -63,10 +66,10 @@ def _normalize_yf_df(df, ticker: str) -> pd.Series | None:
             return None
         return df['Close'].rename(ticker)
 
-def _fetch_one_close(ticker: str) -> pd.Series | None:
+def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
     """Загрузка цены с fallback и общей сессией."""
     t = ALIAS.get(ticker, ticker)
-    # 1-я попытка: как задано в YF_OPTS
+    # 1-я попытка
     try:
         df = yf.download(t, session=YF_SESSION, **YF_OPTS)
         s = _normalize_yf_df(df, t)
@@ -74,8 +77,7 @@ def _fetch_one_close(ticker: str) -> pd.Series | None:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (1st): {e}")
-
-    # 2-я попытка: подлиннее период
+    # 2-я попытка: длиннее период
     try:
         alt = dict(YF_OPTS)
         alt["period"] = "365d"
@@ -85,13 +87,11 @@ def _fetch_one_close(ticker: str) -> pd.Series | None:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (2nd): {e}")
-
-    # не удалось
     return None
 
-async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    data = []
-    bad = []
+async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+    data: List[pd.Series] = []
+    bad: List[str] = []
     for tk in tickers:
         s = _fetch_one_close(tk)
         if s is None or s.dropna().empty:
@@ -116,6 +116,7 @@ def pct_change(series: pd.Series, periods: int) -> float:
     return b / a - 1.0
 
 def confirm_score(pr: pd.Series) -> float:
+    """Сколько МА (50/100/150/200) цена сейчас выше."""
     if len(pr) < 200:
         return 0.0
     close = pr.iloc[-1]
@@ -127,12 +128,13 @@ def confirm_score(pr: pd.Series) -> float:
     for ma in (ma50, ma100, ma150, ma200):
         if close > ma:
             score += 1
-    return score / 4.0
+    return score / 4.0  # 0..1
 
 def rank_pct(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
+    """SMART: выбираем бенчмарк с макс. корреляцией за 180d из BENCH_CANDIDATES."""
     candidates = [b for b in BENCH_CANDIDATES if b in closes.columns]
     if not candidates:
         return BENCH_DEFAULT
@@ -147,18 +149,18 @@ def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
             best = b
     return best
 
-def load_ai_scores() -> dict[str, float]:
+def load_ai_scores() -> Dict[str, float]:
     if not AI_CSV_URL or AI_CSV_URL.lower() == "none":
         return {}
     try:
         text = requests.get(AI_CSV_URL, timeout=10).text
-        out = {}
+        out: Dict[str, float] = {}
         for line in text.splitlines():
             parts = [x.strip() for x in line.split(",")]
             if len(parts) >= 2:
                 tk = parts[0].upper()
                 try:
-                    val = float(parts[1]); out[tk] = val
+                    out[tk] = float(parts[1])
                 except:
                     pass
         return out
@@ -166,7 +168,7 @@ def load_ai_scores() -> dict[str, float]:
         print(f"[AI CSV] fail: {e}")
         return {}
 
-def composite_score(rs21_rel: pd.Series, rs63_rel: pd.Series, conf: pd.Series, ai: dict[str,float]) -> pd.Series:
+def composite_score(rs21_rel: pd.Series, rs63_rel: pd.Series, conf: pd.Series, ai: Dict[str,float]) -> pd.Series:
     r1 = rank_pct(rs21_rel.fillna(-1))
     r2 = rank_pct(rs63_rel.fillna(-1))
     rc = conf.fillna(0)
@@ -182,14 +184,14 @@ def composite_score(rs21_rel: pd.Series, rs63_rel: pd.Series, conf: pd.Series, a
 def fmt_row(i, tk, row):
     return f"{i}) {tk} | score={row['score']:.4f} | RS21={row['rs21_rel']:+.2%} | RS63={row['rs63_rel']:+.2%} | conf={row['conf']:.2f}"
 
-async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: list[str], top_n: int | None):
+async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
     use_tickers = sorted(set([t.upper() for t in tickers] + list(bench_need)))
 
-    # ключевой try/except — вместо падения дадим понятный ответ
+    # ключевой try/except — вместо падения даём понятный ответ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
@@ -215,6 +217,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         bench = pick_benchmark_for(tk, closes) if BENCH_MODE == "smart" else BENCH_DEFAULT
         if bench not in closes.columns:
             bench = BENCH_DEFAULT
+
         rs21 = pct_change(pr, 21)
         rs63 = pct_change(pr, 63)
         if bench in closes.columns:
@@ -249,7 +252,8 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         for i, (tk, row) in enumerate(df_sorted.iterrows(), 1):
             chunk.append(fmt_row(i, tk, row))
             if len(chunk) == 30:
-                await update.message.reply_text("\n".join(chunk)); chunk = []
+                await update.message.reply_text("\n".join(chunk))
+                chunk = []
         if chunk:
             await update.message.reply_text("\n".join(chunk))
 
@@ -382,4 +386,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
--
