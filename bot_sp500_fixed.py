@@ -17,7 +17,7 @@ import requests
 # telegram-bot
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from telegram.request import HTTPXRequest  # <- добавили
+from telegram.request import HTTPXRequest
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -32,17 +32,15 @@ BENCH_CANDIDATES = [
     "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
 ]
 
-# -------------------- Надёжная загрузка цен --------------------
+# -------------------- Нагрузка цен: Yahoo -> (fallback) Stooq --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
-# Единая requests-сессия с User-Agent — уменьшает шанс пустых ответов Yahoo
 YF_SESSION = requests.Session()
 YF_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 })
 
-# при желании можно подменять «капризные» тикеры на аналоги
 ALIAS: Dict[str, str] = {
     # "BITX": "BITB",
     # "USD": "USD",
@@ -66,10 +64,29 @@ def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
             return None
         return df['Close'].rename(ticker)
 
+def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
+    # Пример: SPY -> spy.us, XLF -> xlf.us
+    sym = f"{ticker.lower()}.us"
+    url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+    try:
+        df = pd.read_csv(url)
+        if df is None or df.empty or "Close" not in df.columns or "Date" not in df.columns:
+            return None
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
+        s = df["Close"].astype(float)
+        if s.empty:
+            return None
+        return s.rename(ticker)
+    except Exception as e:
+        print(f"[stooq] fail {ticker}: {e}")
+        return None
+
 def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
-    """Загрузка цены с fallback и общей сессией."""
+    """Сначала Yahoo (две попытки), затем fallback на Stooq."""
     t = ALIAS.get(ticker, ticker)
-    # 1-я попытка
+
+    # 1) Yahoo (основная)
     try:
         df = yf.download(t, session=YF_SESSION, **YF_OPTS)
         s = _normalize_yf_df(df, t)
@@ -77,16 +94,22 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (1st): {e}")
-    # 2-я попытка: длиннее период
+
+    # 2) Yahoo (fallback подлиннее)
     try:
-        alt = dict(YF_OPTS)
-        alt["period"] = "365d"
+        alt = dict(YF_OPTS); alt["period"] = "365d"
         df = yf.download(t, session=YF_SESSION, **alt)
         s = _normalize_yf_df(df, t)
         if s is not None and not s.dropna().empty:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (2nd): {e}")
+
+    # 3) Stooq (надёжный CSV)
+    s = _fetch_from_stooq(t)
+    if s is not None and not s.dropna().empty:
+        return s.rename(ticker)
+
     return None
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
@@ -98,7 +121,7 @@ async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]
             bad.append(tk)
         else:
             data.append(s)
-        await asyncio.sleep(0.15)  # мягкий rate-limit
+        await asyncio.sleep(0.2)  # мягче к источникам
     if not data:
         raise RuntimeError(f"Не удалось загрузить ни один тикер из: {bad}")
     closes = pd.concat(data, axis=1)
@@ -116,7 +139,6 @@ def pct_change(series: pd.Series, periods: int) -> float:
     return b / a - 1.0
 
 def confirm_score(pr: pd.Series) -> float:
-    """Сколько МА (50/100/150/200) цена сейчас выше."""
     if len(pr) < 200:
         return 0.0
     close = pr.iloc[-1]
@@ -128,13 +150,12 @@ def confirm_score(pr: pd.Series) -> float:
     for ma in (ma50, ma100, ma150, ma200):
         if close > ma:
             score += 1
-    return score / 4.0  # 0..1
+    return score / 4.0
 
 def rank_pct(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
-    """SMART: выбираем бенчмарк с макс. корреляцией за 180d из BENCH_CANDIDATES."""
     candidates = [b for b in BENCH_CANDIDATES if b in closes.columns]
     if not candidates:
         return BENCH_DEFAULT
@@ -191,11 +212,10 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         bench_need.update(BENCH_CANDIDATES)
     use_tickers = sorted(set([t.upper() for t in tickers] + list(bench_need)))
 
-    # ключевой try/except — вместо падения даём понятный ответ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
-        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo). Попробуй ещё раз чуть позже.\nДетали: {e}")
+        await update.message.reply_text(f"Не получилось загрузить котировки. Попробуй ещё раз чуть позже.\nДетали: {e}")
         return
 
     missing = [t for t in tickers if t not in closes.columns]
@@ -366,7 +386,6 @@ def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN env var.")
 
-    # увеличиваем таймауты клиента Telegram (решает TimedOut)
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=60.0,
@@ -400,4 +419,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
+щ
