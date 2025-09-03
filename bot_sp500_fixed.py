@@ -3,6 +3,8 @@
 # Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
+import io
+import time
 import math
 import asyncio
 from datetime import datetime
@@ -18,6 +20,7 @@ import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
+from telegram.error import Conflict
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -41,7 +44,7 @@ YF_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 })
 
-# Алиасы для «точечных» тикеров, чтобы yfinance понимал
+# Алиасы, чтобы yfinance понимал
 ALIAS: Dict[str, str] = {
     "BRK.B": "BRK-B",
     "BF.B":  "BF-B",
@@ -66,11 +69,13 @@ def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
         return df['Close']
 
 def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
-    # Stooq: тикеры формата spy.us, aapl.us, brk-b.us, bf-b.us
+    # Stooq: spy.us, aapl.us, brk-b.us, ...
     sym = f"{ticker.lower()}.us"
     url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
     try:
-        df = pd.read_csv(url)
+        r = requests.get(url, timeout=8)  # явный таймаут, чтобы не зависать
+        r.raise_for_status()
+        df = pd.read_csv(io.StringIO(r.text))
         if df is None or df.empty or "Close" not in df.columns or "Date" not in df.columns:
             return None
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
@@ -108,15 +113,16 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
     return None
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
+    """Загрузка в фоновых потоках, чтобы бот отвечал на /ping во время расчёта."""
     data: List[pd.Series] = []
     bad: List[str] = []
     for tk in tickers:
-        s = _fetch_one_close(tk)
+        s = await asyncio.to_thread(_fetch_one_close, tk)  # неблокирующе для event loop
         if s is None or s.dropna().empty:
             bad.append(tk)
         else:
             data.append(s)
-        await asyncio.sleep(0.2)  # мягче к источникам
+        await asyncio.sleep(0.05)  # мягкий троттлинг
     if not data:
         raise RuntimeError(f"Не удалось загрузить ни один тикер из: {bad}")
     closes = pd.concat(data, axis=1)
@@ -201,13 +207,12 @@ def fmt_row(i, tk, row):
 
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
-    # добираем бенчмарки к загрузке
+    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
     use_tickers = sorted(set([t.upper() for t in tickers] + list(bench_need)))
 
-    # загрузка цен
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
@@ -274,7 +279,6 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-# SP250 — топ ~250 бумаг из S&P 500 по весу (порядок не критичен)
 SP250 = [
 "NVDA","MSFT","AAPL","AMZN","GOOGL","GOOG","BRK.B","META","TSLA","AVGO","LLY","JPM","UNH","V","MA","XOM","JNJ","PG","ORCL","CVX",
 "MRK","COST","ABBV","KO","PEP","BAC","WMT","NFLX","ADBE","CRM","CSCO","TMO","ACN","MCD","AMD","WFC","DHR","LIN","ABT","TXN",
@@ -296,7 +300,6 @@ SP250 = [
 "PAYX","VZ","TMUS","DIS","PARA","FOXA","FOX","NWSA","NWS"
 ]
 
-# ETFALL — обычные ETF
 ETFALL = [
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
@@ -306,7 +309,7 @@ ETFALL = [
     "BITO","LIT","MAGS","ARKK","KRE","KBE",
 ]
 
-# ETFX — плечевые/инверсные/одиночные (дополнены твоими тикерами)
+# ETFX — плечевые/инверсные/одиночные (добавлены твои тикеры)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
@@ -322,6 +325,14 @@ async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tz = ZoneInfo(BOT_TZ)
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     await update.message.reply_text(f"Я на связи ✅\n{now} {BOT_TZ}")
+
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = await context.bot.get_me()
+    await update.message.reply_text(
+        f"Bot: @{me.username} (id={me.id})\n"
+        f"MODE={BENCH_MODE}  DEFAULT_BENCH={BENCH_DEFAULT}\n"
+        f"W_AI={W_AI}  TZ={BOT_TZ}"
+    )
 
 async def sp5005_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "SP250", SP250, top_n=5)
@@ -392,7 +403,7 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("Не понял число. Пример: /setw_ai 0.2")
 
-# -------------------- ИНИЦИАЛИЗАЦИЯ: снять вебхук и расширить таймауты --------------------
+# -------------------- ИНИЦИАЛИЗАЦИЯ --------------------
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -401,19 +412,13 @@ async def _post_init(app: Application):
     except Exception as e:
         print(f"[init] delete_webhook error: {e}")
 
-# -------------------- MAIN --------------------
-def main() -> None:
-    if not BOT_TOKEN:
-        raise SystemExit("Set TELEGRAM_TOKEN env var.")
-
-    # увеличенные таймауты клиента Telegram (устойчивей к сетевым лагам)
+def build_app() -> Application:
     request = HTTPXRequest(
         connect_timeout=30.0,
         read_timeout=60.0,
         write_timeout=30.0,
         pool_timeout=30.0,
     )
-
     app = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -421,22 +426,43 @@ def main() -> None:
         .post_init(_post_init)
         .build()
     )
-
+    # handlers
     app.add_handler(CommandHandler("ping", ping_cmd))
+    app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
     app.add_handler(CommandHandler("sp50010", sp50010_cmd))
     app.add_handler(CommandHandler("etfall", etfall_cmd))
     app.add_handler(CommandHandler("etfx", etfx_cmd))
     app.add_handler(CommandHandler("etf", etf_full_cmd))
-
     app.add_handler(CommandHandler("benchmode", benchmode_cmd))
     app.add_handler(CommandHandler("setbenchmark", setbenchmark_cmd))
     app.add_handler(CommandHandler("benchcandidates", benchcandidates_cmd))
     app.add_handler(CommandHandler("getbench", getbench_cmd))
     app.add_handler(CommandHandler("setaisource", setaisource_cmd))
     app.add_handler(CommandHandler("setw_ai", setw_ai_cmd))
+    return app
 
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+# -------------------- MAIN с автоповтором при Conflict --------------------
+def main() -> None:
+    if not BOT_TOKEN:
+        raise SystemExit("Set TELEGRAM_TOKEN env var.")
+    while True:
+        app = build_app()
+        try:
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+            break  # аккуратный выход (если когда-нибудь понадобится)
+        except Conflict as e:
+            # если во время деплоя был второй поллер — просто подождём и перезапустим
+            print(f"[conflict] {e}. retry in 5s")
+            try:
+                asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
+            except Exception as ee:
+                print(f"[conflict] delete_webhook err: {ee}")
+            time.sleep(5)
+            continue
+        except Exception as e:
+            print(f"[fatal] {e}. restart in 5s")
+            time.sleep(5)
 
 if __name__ == "__main__":
     main()
