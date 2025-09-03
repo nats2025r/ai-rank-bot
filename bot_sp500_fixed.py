@@ -406,7 +406,9 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- ИНИЦИАЛИЗАЦИЯ --------------------
 async def _post_init(app: Application):
     try:
+        # сносим возможный вебхук и даём старому поллеру закрыться
         await app.bot.delete_webhook(drop_pending_updates=True)
+        await asyncio.sleep(3)  # ключевая пауза, чтобы не поймать Conflict при деплое
         me = await app.bot.get_me()
         print(f"[init] webhook cleared. Bot: @{me.username} (id={me.id})")
     except Exception as e:
@@ -450,9 +452,9 @@ def main() -> None:
         app = build_app()
         try:
             app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-            break  # аккуратный выход (если когда-нибудь понадобится)
+            break  # нормальный выход
         except Conflict as e:
-            # если во время деплоя был второй поллер — просто подождём и перезапустим
+            # если во время деплоя был второй поллер — ждём и перезапускаем
             print(f"[conflict] {e}. retry in 5s")
             try:
                 asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
