@@ -1,5 +1,5 @@
 # bot_sp500_fixed.py
-# Telegram-бот: AI-моментум + ConfirmScore для SP250/ETFALL/ETFX
+# Telegram-бот: AI-моментум + ConfirmScore для SP127/ETFALL/ETFX
 # Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
@@ -27,16 +27,15 @@ BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 AI_CSV_URL = os.getenv("AI_CSV_URL", "none").strip()
 W_AI = float(os.getenv("W_AI", "0.0"))
 BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
-BENCH_MODE = os.getenv("BENCH_MODE", "global").strip().lower()  # "global" | "smart"
+BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
-# Кандидаты бенчмарков для SMART-режима
 BENCH_CANDIDATES = [
     "SPY","QQQ","IWM","DIA",
     "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
 ]
 
-# -------------------- Надёжная загрузка цен: Yahoo -> (fallback) Stooq --------------------
+# -------------------- Надёжная загрузка цен --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
 YF_SESSION = requests.Session()
@@ -44,7 +43,6 @@ YF_SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 })
 
-# Алиасы, чтобы yfinance понимал
 ALIAS: Dict[str, str] = {
     "BRK.B": "BRK-B",
     "BF.B":  "BF-B",
@@ -69,11 +67,10 @@ def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
         return df['Close']
 
 def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
-    # Stooq: spy.us, aapl.us, brk-b.us, ...
     sym = f"{ticker.lower()}.us"
     url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
     try:
-        r = requests.get(url, timeout=8)  # явный таймаут, чтобы не зависать
+        r = requests.get(url, timeout=8)
         r.raise_for_status()
         df = pd.read_csv(io.StringIO(r.text))
         if df is None or df.empty or "Close" not in df.columns or "Date" not in df.columns:
@@ -87,9 +84,7 @@ def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
         return None
 
 def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
-    """Сначала Yahoo (две попытки), затем fallback на Stooq."""
     t = ALIAS.get(ticker, ticker)
-    # Yahoo (основная)
     try:
         df = yf.download(t, session=YF_SESSION, **YF_OPTS)
         s = _normalize_yf_df(df, t)
@@ -97,7 +92,6 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (1st): {e}")
-    # Yahoo (альтернативный период)
     try:
         alt = dict(YF_OPTS); alt["period"] = "365d"
         df = yf.download(t, session=YF_SESSION, **alt)
@@ -106,28 +100,47 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (2nd): {e}")
-    # Stooq fallback
     s = _fetch_from_stooq(t)
     if s is not None and not s.dropna().empty:
         return s.rename(ticker)
     return None
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    """Загрузка в фоновых потоках, чтобы бот отвечал на /ping во время расчёта."""
+    """Поштучно + троттлинг; при полном провале — bulk-fallback к Yahoo."""
     data: List[pd.Series] = []
     bad: List[str] = []
+
     for tk in tickers:
-        s = await asyncio.to_thread(_fetch_one_close, tk)  # неблокирующе для event loop
+        s = await asyncio.to_thread(_fetch_one_close, tk)
         if s is None or s.dropna().empty:
             bad.append(tk)
         else:
             data.append(s)
-        await asyncio.sleep(0.05)  # мягкий троттлинг
-    if not data:
-        raise RuntimeError(f"Не удалось загрузить ни один тикер из: {bad}")
-    closes = pd.concat(data, axis=1)
-    closes = closes.dropna(how="all").dropna(axis=1, how="all")
-    return closes, bad
+        pause = 0.05 if len(tickers) <= 50 else 0.10 if len(tickers) <= 100 else 0.15
+        await asyncio.sleep(pause)
+
+    if data:
+        closes = pd.concat(data, axis=1).dropna(how="all").dropna(axis=1, how="all")
+        return closes, bad
+
+    # bulk-fallback
+    try:
+        syms = " ".join([ALIAS.get(t, t) for t in tickers])
+        df_bulk = yf.download(syms, session=YF_SESSION, **YF_OPTS)
+        if isinstance(df_bulk.columns, pd.MultiIndex) and "Close" in df_bulk.columns.get_level_values(0):
+            close_block = df_bulk["Close"].copy()
+            rename_map = {ALIAS.get(k, k): k for k in tickers}
+            close_block = close_block.rename(columns=rename_map)
+            close_block = close_block.loc[:, [t for t in tickers if t in close_block.columns]]
+            if not close_block.empty:
+                return close_block.dropna(how="all"), tickers
+        elif "Close" in df_bulk.columns and len(tickers) == 1:
+            s = df_bulk["Close"].rename(tickers[0])
+            return pd.concat([s], axis=1), tickers
+    except Exception as e:
+        print(f"[bulk yfinance] fail: {e}")
+
+    raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
 
 # -------------------- Вспомогалки --------------------
 def pct_change(series: pd.Series, periods: int) -> float:
@@ -139,7 +152,6 @@ def pct_change(series: pd.Series, periods: int) -> float:
     return b / a - 1.0
 
 def confirm_score(pr: pd.Series) -> float:
-    """Сколько МА (50/100/150/200) цена сейчас выше."""
     if len(pr) < 200:
         return 0.0
     close = pr.iloc[-1]
@@ -157,7 +169,6 @@ def rank_pct(series: pd.Series) -> pd.Series:
     return series.rank(pct=True, method="average")
 
 def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
-    """SMART: выбираем бенчмарк с макс. корреляцией из BENCH_CANDIDATES."""
     candidates = [b for b in BENCH_CANDIDATES if b in closes.columns]
     if not candidates:
         return BENCH_DEFAULT
@@ -170,12 +181,12 @@ def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
             best_corr = corr; best = b
     return best
 
-def load_ai_scores() -> Dict[str, float]:
+def load_ai_scores() -> Dict[str,float]:
     if not AI_CSV_URL or AI_CSV_URL.lower() == "none":
         return {}
     try:
         text = requests.get(AI_CSV_URL, timeout=10).text
-        out: Dict[str, float] = {}
+        out: Dict[str,float] = {}
         for line in text.splitlines():
             parts = [x.strip() for x in line.split(",")]
             if len(parts) >= 2:
@@ -207,7 +218,6 @@ def fmt_row(i, tk, row):
 
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
-    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
@@ -216,7 +226,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
-        await update.message.reply_text(f"Не получилось загрузить котировки. Попробуй ещё раз чуть позже.\nДетали: {e}")
+        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo/Stooq). Попробуй ещё раз.\nДетали: {e}")
         return
 
     missing = [t for t in tickers if t not in closes.columns]
@@ -235,7 +245,6 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         pr = closes[tk].dropna()
         if pr.empty:
             continue
-
         bench = pick_benchmark_for(tk, closes) if BENCH_MODE == "smart" else BENCH_DEFAULT
         if bench not in closes.columns:
             bench = BENCH_DEFAULT
@@ -279,37 +288,40 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-SP250 = [
-"NVDA","MSFT","AAPL","AMZN","GOOGL","GOOG","BRK.B","META","TSLA","AVGO","LLY","JPM","UNH","V","MA","XOM","JNJ","PG","ORCL","CVX",
-"MRK","COST","ABBV","KO","PEP","BAC","WMT","NFLX","ADBE","CRM","CSCO","TMO","ACN","MCD","AMD","WFC","DHR","LIN","ABT","TXN",
-"IBM","PM","CAT","COP","NKE","AMAT","MDT","HON","UPS","QCOM","LMT","MS","BKNG","LOW","GE","BMY","SPGI","T","AMGN","RTX","C",
-"GS","NOW","SBUX","GILD","DE","ADP","INTU","MU","CHTR","TMUS","DIS","CMCSA","ELV","MMC","MDLZ","PLD","BLK","ISRG","ZTS","ADI",
-"TGT","REGN","CB","PGR","SYK","SO","EOG","HCA","PANW","KLAC","BSX","TJX","CME","MCO","USB","EQIX","PXD","AON","FI","AXP",
-"OXY","SHW","ITW","NOC","CDW","LRCX","ECL","ROP","CTAS","ROST","KDP","ORLY","GPN","FIS","PYPL","KHC","HSY","GIS","KR","SYY",
-"KMB","CL","CLX","STZ","TAP","MKC","CHD","MO","SCHW","BK","STT","TROW","BEN","KKR","BX","ICE","CBOE","MSCI","BA","GD","HII",
-"ETN","PH","EMR","ROK","TT","CARR","JCI","IR","MMM","CMI","PCAR","LUV","DAL","UAL","FDX","ODFL","EXPD","CHRW","UNP","NSC","CSX",
-"URI","WM","RSG","AMT","CCI","DLR","O","VICI","WELL","SPG","PSA","AVB","EQR","ESS","MAA","CPT","VTR","HST","BXP","ARE","CBRE",
-"NEE","DUK","SO","D","EXC","SRE","PEG","XEL","EIX","WEC","ED","AEP","PPL","AEE","CMS","FE","AES","NRG","CEG","ES","AWK","DTE",
-"SLB","HAL","BKR","VLO","MPC","PSX","HES","DVN","FANG","APA","MRO","KMI","WMB","OKE","LNG","EQT",
-"APD","PPG","MLM","VMC","NUE","NEM","FCX","DD","DOW","ALB","CF","MOS","LYB","IP","PKG","WRK","CE","IFF","AVY","BALL","CTVA",
-"PFE","MRK","BMY","GILD","REGN","VRTX","BIIB","ZTS","ISRG","BDX","BAX","ZBH","EW","IDXX","DXCM","ALGN","RMD","STE","WAT","TFX",
-"MTD","IQV","ILMN","GEHC","CVS","CI","HUM","CNC","COR","CAH","MCK","EL","YUM","CMG","HD","LOW","NKE","GM","F","HLT","MAR",
-"MGM","LVS","WYNN","DG","DLTR","RCL","ORLY","AZO","AAP","ULTA","ETSY","EBAY","AIG","ALL","TRV","HIG","MET","PRU","AFL",
-"AON","WTW","CB","L","USB","PNC","TFC","FITB","HBAN","KEY","MTB","NTRS","CFG","COF","DFS","SYF",
-"NXPI","MCHP","MPWR","TER","KEYS","TEL","GLW","APH","FSLR","ENPH","ON","WDAY","SNPS","CDNS","ANSS","ADSK","ANET","HPQ",
-"PAYX","VZ","TMUS","DIS","PARA","FOXA","FOX","NWSA","NWS"
-]
+# Жёстко зашитый список SP127 (топ-127 S&P 500 по весу; COIN включён)
+SP250 = """
+NVDA MSFT AAPL AMZN META GOOGL AVGO GOOG TSLA BRK.B
+JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
+HD ABBV PLTR BAC PG CVX GE KO TMUS UNH
+CSCO AMD WFC PM CRM MS ABT IBM MCD AXP
+LIN GS MRK RTX DIS T PEP UBER CAT NOW
+INTU VZ TMO BKNG TXN BA SCHW C ANET BLK
+QCOM SPGI ACN ISRG BSX TJX AMGN ADBE NEE
+SYK LOW PGR DHR PFE COF GILD HON APH ETN
+MU UNP BX PANW DE CMCSA AMAT LRCX ADP KKR
+ADI COP MDT WELL MO NKE CB KLAC SNPS DASH
+INTC LMT PLD CRWD VRTX MMC SO ICE SBUX BMY
+CME RCL CEG HCA PH DUK CDNS CVS AMT SHW
+TT WM MCO ORLY GD MCK NEM COIN
+""".split()
 
+# ETFALL — добавлен MSTR
 ETFALL = [
+    # broad market / стилевые
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
+    # секторные SPDR
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
+    # облигации/кредит
     "TLT","IEF","HYG","LQD","AGG","BND",
+    # сырьё / золото / серебро
     "GLD","IAU","SLV","GDX",
+    # факторные/нишевые
     "SMH","SOXX","IBB","XBI","ITB","XHB","IYT","XOP","XME","XRT",
-    "BITO","LIT","MAGS","ARKK","KRE","KBE",
+    # «популярные»
+    "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX — плечевые/инверсные/одиночные (добавлены твои тикеры)
+# ETFX — плечевые/инверсные/одиночные (включая твои кастомные тикеры)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
@@ -335,10 +347,10 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def sp5005_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await universe_rank(update, context, "SP250", SP250, top_n=5)
+    await universe_rank(update, context, "SP127", SP250, top_n=5)
 
 async def sp50010_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await universe_rank(update, context, "SP250", SP250, top_n=10)
+    await universe_rank(update, context, "SP127", SP250, top_n=10)
 
 async def etfall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFALL", ETFALL, top_n=10)
@@ -347,7 +359,6 @@ async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFX", ETFX, top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /etf  или /etf etfall|etfx — полный рейтинг
     args = [a.lower() for a in context.args] if context.args else []
     name = "etfall"; tickers = ETFALL
     if args and args[0] in ("etfall","etfx"):
@@ -356,7 +367,7 @@ async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tickers = ETFX
     await universe_rank(update, context, name.upper(), tickers, top_n=None)
 
-# Настройки
+# настройки
 async def benchmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BENCH_MODE
     if context.args:
@@ -406,9 +417,8 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- ИНИЦИАЛИЗАЦИЯ --------------------
 async def _post_init(app: Application):
     try:
-        # сносим возможный вебхук и даём старому поллеру закрыться
         await app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(3)  # ключевая пауза, чтобы не поймать Conflict при деплое
+        await asyncio.sleep(3)  # даём старому поллеру выключиться
         me = await app.bot.get_me()
         print(f"[init] webhook cleared. Bot: @{me.username} (id={me.id})")
     except Exception as e:
@@ -428,7 +438,6 @@ def build_app() -> Application:
         .post_init(_post_init)
         .build()
     )
-    # handlers
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
@@ -452,9 +461,8 @@ def main() -> None:
         app = build_app()
         try:
             app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-            break  # нормальный выход
+            break
         except Conflict as e:
-            # если во время деплоя был второй поллер — ждём и перезапускаем
             print(f"[conflict] {e}. retry in 5s")
             try:
                 asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
@@ -468,3 +476,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
