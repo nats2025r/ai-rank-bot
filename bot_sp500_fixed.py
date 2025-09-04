@@ -1,6 +1,6 @@
 # bot_sp500_fixed.py
 # Telegram-бот: AI-моментум + ConfirmScore для SP127/ETFALL/ETFX
-# Требования: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
+# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
 import io
@@ -17,7 +17,6 @@ import pandas as pd
 import yfinance as yf
 import requests
 
-# telegram-bot
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
@@ -31,16 +30,11 @@ BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
 BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
-# Кандидаты бенчмарков для SMART-режима
-BENCH_CANDIDATES = [
-    "SPY","QQQ","IWM","DIA",
-    "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
-]
+BENCH_CANDIDATES = ["SPY","QQQ","IWM","DIA","XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI"]
 
 # -------------------- Надёжная загрузка цен --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
-# Пул UA для обхода случайных блокировок
 UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
@@ -56,8 +50,7 @@ def _new_session() -> requests.Session:
 ALIAS: Dict[str, str] = {
     "BRK.B": "BRK-B",
     "BF.B":  "BF-B",
-    # Если BITX чудит — можно подменить:
-    "BITX":  "BITB",
+    "BITX":  "BITB",  # если BITX флапает
 }
 
 def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
@@ -78,6 +71,28 @@ def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
             return None
         return df['Close']
 
+def _fetch_from_yahoo_csv(ticker: str) -> Optional[pd.Series]:
+    """Прямой CSV-эндпоинт Yahoo — часто работает, когда JSON API молчит."""
+    t = ALIAS.get(ticker, ticker)
+    end = int(time.time())
+    start = end - 400 * 24 * 3600
+    url = (f"https://query1.finance.yahoo.com/v7/finance/download/{t}"
+           f"?period1={start}&period2={end}&interval=1d&events=history&includeAdjustedClose=true")
+    try:
+        r = _new_session().get(url, timeout=10)
+        if r.status_code == 200 and "Date,Open,High,Low,Close" in r.text:
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty or "Date" not in df.columns:
+                return None
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+            df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
+            col = "Adj Close" if "Adj Close" in df.columns else "Close"
+            s = df[col].astype(float)
+            return s.rename(ticker) if not s.dropna().empty else None
+    except Exception as e:
+        print(f"[yahoo-csv] fail {ticker}: {e}")
+    return None
+
 def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
     sym = f"{ticker.lower()}.us"
     url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
@@ -90,7 +105,7 @@ def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
         s = df["Close"].astype(float)
-        return s if not s.empty else None
+        return s.rename(ticker) if not s.dropna().empty else None
     except Exception as e:
         print(f"[stooq] fail {ticker}: {e}")
         return None
@@ -113,17 +128,18 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
             return s.rename(ticker)
     except Exception as e:
         print(f"[yfinance] fail {ticker} (2nd): {e}")
+    s = _fetch_from_yahoo_csv(t)
+    if s is not None and not s.dropna().empty:
+        return s.rename(ticker)
     s = _fetch_from_stooq(t)
     if s is not None and not s.dropna().empty:
         return s.rename(ticker)
     return None
 
 def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay: float = 3.0) -> Optional[pd.DataFrame]:
-    """Групповая загрузка: делим на пачки, несколько попыток с разными UA."""
     for attempt in range(tries):
-        colls = []
+        colls, ok_any = [], False
         sess = _new_session()
-        ok_any = False
         for i in range(0, len(ticks), chunk):
             part = ticks[i:i+chunk]
             syms = " ".join([ALIAS.get(t, t) for t in part])
@@ -131,7 +147,6 @@ def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay
                 df = yf.download(syms, session=sess, **YF_OPTS)
                 if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
                     blk = df["Close"].copy()
-                    # вернуть исходные тикеры (без алиасов в именах)
                     rename_map = {ALIAS.get(t, t): t for t in part}
                     blk = blk.rename(columns=rename_map)
                     blk = blk.loc[:, [t for t in part if t in blk.columns]]
@@ -150,7 +165,6 @@ def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay
     return None
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    """Сначала поштучно с троттлингом. При провале — bulk-попытка с ретраями."""
     data: List[pd.Series] = []
     bad: List[str] = []
 
@@ -160,7 +174,6 @@ async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]
             bad.append(tk)
         else:
             data.append(s)
-        # небольшая пауза: чем больше вселенная, тем больше пауза
         pause = 0.07 if len(tickers) <= 50 else 0.12 if len(tickers) <= 100 else 0.18
         await asyncio.sleep(pause)
 
@@ -168,15 +181,14 @@ async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]
         closes = pd.concat(data, axis=1).dropna(how="all").dropna(axis=1, how="all")
         return closes, bad
 
-    # ничего не вышло — пробуем группами
-    bulk = _bulk_chunk_download(tickers, chunk=8, tries=3, delay=3.0)
+    bulk = _bulk_chunk_download(tickers, chunk=8, tries=4, delay=4.0)
     if bulk is not None and not bulk.empty:
         still_bad = [t for t in tickers if t not in bulk.columns]
         return bulk, still_bad
 
     raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
 
-# -------------------- Вспомогалки --------------------
+# -------------------- Метрики --------------------
 def pct_change(series: pd.Series, periods: int) -> float:
     if len(series) < periods + 1:
         return np.nan
@@ -252,7 +264,6 @@ def fmt_row(i, tk, row):
 
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
-    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
@@ -296,10 +307,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             rs21_rel, rs63_rel = rs21, rs63
 
         conf = confirm_score(pr)
-        rows.append({
-            "ticker": tk, "bench": bench,
-            "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf
-        })
+        rows.append({"ticker": tk, "bench": bench, "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf})
 
     df = pd.DataFrame(rows).set_index("ticker")
     if df.empty:
@@ -326,7 +334,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-# Жёстко зашитый список SP127 (COIN включён)
+# SP127 (COIN включён)
 SP250 = """
 NVDA MSFT AAPL AMZN META GOOGL AVGO GOOG TSLA BRK.B
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
@@ -345,21 +353,15 @@ TT WM MCO ORLY GD MCK NEM COIN
 
 # ETFALL — добавлен MSTR
 ETFALL = [
-    # broad market / стилевые
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
-    # секторные SPDR
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
-    # облигации/кредит
     "TLT","IEF","HYG","LQD","AGG","BND",
-    # сырьё / золото / серебро
     "GLD","IAU","SLV","GDX",
-    # факторные/нишевые
     "SMH","SOXX","IBB","XBI","ITB","XHB","IYT","XOP","XME","XRT",
-    # «популярные»
     "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX — плечевые/инверсные/одиночные (включая твои кастомные тикеры)
+# ETFX — плечевые/инверсные/одиночные (твои кастомные тоже)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
@@ -397,7 +399,6 @@ async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFX", ETFX, top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /etf  или /etf etfall|etfx
     args = [a.lower() for a in context.args] if context.args else []
     name = "etfall"; tickers = ETFALL
     if args and args[0] in ("etfall","etfx"):
@@ -457,26 +458,15 @@ async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _post_init(app: Application):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
-        await asyncio.sleep(3)  # даём старому поллеру выключиться
+        await asyncio.sleep(3)
         me = await app.bot.get_me()
         print(f"[init] webhook cleared. Bot: @{me.username} (id={me.id})")
     except Exception as e:
         print(f"[init] delete_webhook error: {e}")
 
 def build_app() -> Application:
-    request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=60.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .post_init(_post_init)
-        .build()
-    )
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
+    app = (Application.builder().token(BOT_TOKEN).request(request).post_init(_post_init).build())
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
@@ -492,7 +482,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("setw_ai", setw_ai_cmd))
     return app
 
-# -------------------- MAIN с автоповтором при Conflict --------------------
+# -------------------- MAIN --------------------
 def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_TOKEN env var.")
@@ -507,8 +497,7 @@ def main() -> None:
                 asyncio.run(app.bot.delete_webhook(drop_pending_updates=True))
             except Exception as ee:
                 print(f"[conflict] delete_webhook err: {ee}")
-            time.sleep(5)
-            continue
+            time.sleep(5); continue
         except Exception as e:
             print(f"[fatal] {e}. restart in 5s")
             time.sleep(5)
