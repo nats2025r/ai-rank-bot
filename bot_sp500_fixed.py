@@ -1,5 +1,5 @@
 # bot_sp500_fixed.py
-# Telegram-бот: Моментум + ConfirmScore для SP250 / ETFALL / ETFX (БЕЗ AI)
+# Telegram-бот: Моментум + ConfirmScore для SP250 / ETFALL / ETFX (без AI)
 # Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
@@ -21,6 +21,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import Conflict
+from time import time as _time
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -42,7 +43,6 @@ UA_POOL = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
 ]
-
 def _new_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": random.choice(UA_POOL)})
@@ -111,14 +111,37 @@ def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
         print(f"[stooq] fail {ticker}: {e}")
         return None
 
-def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
+# -------------------- КЭШ ЦЕН --------------------
+CACHE_TTL = int(os.getenv("PRICE_CACHE_TTL", "1800"))  # 30 минут
+PRICE_CACHE: dict[str, tuple[float, pd.Series]] = {}
+
+def _cache_get(ticker: str) -> pd.Series | None:
+    rec = PRICE_CACHE.get(ticker)
+    if not rec:
+        return None
+    ts, s = rec
+    if _time() - ts < CACHE_TTL and s is not None and not s.dropna().empty:
+        return s
+    return None
+
+def _cache_put(ticker: str, s: pd.Series | None) -> None:
+    if s is not None and not s.dropna().empty:
+        PRICE_CACHE[ticker] = (_time(), s)
+
+# -------------------- ОДИН ТИКЕР --------------------
+def _fetch_one_close(ticker: str) -> pd.Series | None:
+    # кэш
+    s_cached = _cache_get(ticker)
+    if s_cached is not None:
+        return s_cached.rename(ticker)
+
     t = ALIAS.get(ticker, ticker)
     sess = _new_session()
     try:
         df = yf.download(t, session=sess, **YF_OPTS)
         s = _normalize_yf_df(df, t)
         if s is not None and not s.dropna().empty:
-            return s.rename(ticker)
+            s = s.rename(ticker); _cache_put(ticker, s); return s
     except Exception as e:
         print(f"[yfinance] fail {ticker} (1st): {e}")
     try:
@@ -126,71 +149,103 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
         df = yf.download(t, session=_new_session(), **alt)
         s = _normalize_yf_df(df, t)
         if s is not None and not s.dropna().empty:
-            return s.rename(ticker)
+            s = s.rename(ticker); _cache_put(ticker, s); return s
     except Exception as e:
         print(f"[yfinance] fail {ticker} (2nd): {e}")
+
     s = _fetch_from_yahoo_csv(t)
     if s is not None and not s.dropna().empty:
-        return s.rename(ticker)
+        s = s.rename(ticker); _cache_put(ticker, s); return s
     s = _fetch_from_stooq(t)
     if s is not None and not s.dropna().empty:
-        return s.rename(ticker)
+        s = s.rename(ticker); _cache_put(ticker, s); return s
+
     return None
 
-# --------- НОВОЕ: быстрые пакетные загрузки + добор поштучно ----------
-def _bulk_chunk_download(ticks: list[str], chunk: int = 18, tries: int = 2, delay: float = 2.0) -> Optional[pd.DataFrame]:
-    """Пакетная загрузка через yf.download для большого списка тикеров."""
-    out = None
-    for attempt in range(tries):
-        parts = [ticks[i:i+chunk] for i in range(0, len(ticks), chunk)]
-        frames = []
-        for part in parts:
-            syms = " ".join([ALIAS.get(t, t) for t in part])
-            try:
-                df = yf.download(syms, **YF_OPTS)
-                if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
-                    blk = df["Close"].copy()
-                    rename_map = {ALIAS.get(t, t): t for t in part}
-                    blk = blk.rename(columns=rename_map)
-                    blk = blk.loc[:, [t for t in part if t in blk.columns]]
-                    if not blk.empty:
-                        frames.append(blk)
-                elif "Close" in df.columns and len(part) == 1:
-                    frames.append(df["Close"].rename(part[0]).to_frame())
-            except Exception as e:
-                print(f"[bulk] fail {part}: {e}")
-            time.sleep(0.3)
-        if frames:
-            out = pd.concat(frames, axis=1).dropna(how="all")
-            if out is not None and not out.empty:
-                return out
-        time.sleep(delay)
-    return out
+# -------------------- БАТЧ ЗАГРУЗКА + ДОКАЧКА --------------------
+def _bulk_chunk_download(ticks: list[str], chunk: int = 18, tries: int = 2, delay: float = 2.0) -> pd.DataFrame | None:
+    """
+    Быстрая загрузка пачками. Если не вышло — уменьшаем размер пачки и пробуем снова.
+    Учитывает кэш: то, что уже кэшировано, не запрашиваем.
+    """
+    for chunk_size in (chunk, 12, 8, 5):
+        out = None
+        for attempt in range(tries):
+            parts = [ticks[i:i+chunk_size] for i in range(0, len(ticks), chunk_size)]
+            frames = []
+            for part in parts:
+                # что уже в кэше
+                cached_cols = []
+                cached_series = []
+                for t in part:
+                    cs = _cache_get(t)
+                    if cs is not None:
+                        cached_cols.append(t)
+                        cached_series.append(cs.rename(t))
+                need = [t for t in part if t not in cached_cols]
+                if cached_series:
+                    frames.append(pd.concat([s for s in cached_series], axis=1))
+
+                if need:
+                    syms = " ".join([ALIAS.get(t, t) for t in need])
+                    try:
+                        df = yf.download(syms, **YF_OPTS)
+                        if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
+                            blk = df["Close"].copy()
+                            rename_map = {ALIAS.get(t, t): t for t in need}
+                            blk = blk.rename(columns=rename_map)
+                            blk = blk.loc[:, [t for t in need if t in blk.columns]]
+                            if not blk.empty:
+                                for col in blk.columns:
+                                    _cache_put(col, blk[col].dropna())
+                                frames.append(blk)
+                        elif "Close" in df.columns and len(need) == 1:
+                            s = df["Close"].rename(need[0])
+                            _cache_put(need[0], s.dropna())
+                            frames.append(s.to_frame())
+                    except Exception as e:
+                        print(f"[bulk {chunk_size}] fail {need}: {e}")
+                    time.sleep(0.3)
+            if frames:
+                out = pd.concat(frames, axis=1).dropna(how="all")
+                if out is not None and not out.empty:
+                    return out
+            time.sleep(delay)
+    return None
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    """Сначала быстро грузим вселенную пачками, затем добираем поштучно то, что не подъехало."""
-    bulk = await asyncio.to_thread(_bulk_chunk_download, tickers, 18, 2, 2.0)
-    closes = None
-    bad = []
+    # 0) что есть в кэше
+    cached = []
+    to_fetch = []
+    for t in tickers:
+        cs = _cache_get(t)
+        if cs is not None:
+            cached.append(cs.rename(t))
+        else:
+            to_fetch.append(t)
 
-    if bulk is not None and not bulk.empty:
-        closes = bulk
-        bad = [t for t in tickers if t not in closes.columns]
+    closes = pd.concat(cached, axis=1) if cached else None
 
-    if bad:
-        adds = []
-        still_bad = []
-        for tk in bad:
-            s = await asyncio.to_thread(_fetch_one_close, tk)
-            if s is None or s.dropna().empty:
-                still_bad.append(tk)
-            else:
-                adds.append(s)
-            await asyncio.sleep(0.1)
-        if adds:
-            add_df = pd.concat(adds, axis=1)
-            closes = add_df if closes is None else pd.concat([closes, add_df], axis=1)
-        bad = still_bad
+    # 1) пробуем батчи
+    bad: List[str] = []
+    if to_fetch:
+        bulk = await asyncio.to_thread(_bulk_chunk_download, to_fetch, 18, 2, 2.0)
+        if bulk is not None and not bulk.empty:
+            closes = bulk if closes is None else pd.concat([closes, bulk], axis=1)
+        # кого нет — поштучно
+        still = [t for t in to_fetch if closes is None or t not in closes.columns]
+        if still:
+            adds = []
+            for tk in still:
+                s = await asyncio.to_thread(_fetch_one_close, tk)
+                if s is None or s.dropna().empty:
+                    bad.append(tk)
+                else:
+                    adds.append(s)
+                await asyncio.sleep(0.05)
+            if adds:
+                add_df = pd.concat(adds, axis=1)
+                closes = add_df if closes is None else pd.concat([closes, add_df], axis=1)
 
     if closes is None or closes.dropna(how="all").empty:
         raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
@@ -242,8 +297,6 @@ def fmt_row(i, tk, row):
 
 # -------------------- РАНЖИРОВАНИЕ --------------------
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
-    # (убрано сообщение «Считаю … 20–30 сек»)
-
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
@@ -252,7 +305,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
-        await update.message.reply_text(f"Не получилось загрузить котировки. Попробуй ещё раз.\nДетали: {e}")
+        await update.message.reply_text(f"Не получилось загрузить котировки. Попробуй ещё раз чуть позже.\nДетали: {e}")
         return
 
     missing = [t for t in tickers if t not in closes.columns]
@@ -324,7 +377,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ЖЁСТКО ЗАШИТЫЕ ВСЕЛЕННЫЕ --------------------
-# (список укорочен в этом сообщении ради длины — у тебя уже сохранён полный 250; можно расширить)
+# Примерный список SP250 (можно заменить на свой 127/250 по весам — логика не зависит от длины)
 SP250 = """
 NVDA MSFT AAPL AMZN META AVGO GOOGL GOOG BRK.B TSLA
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
@@ -366,7 +419,7 @@ ETFALL = [
     "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX (плечевые/инверсные + твои кастомы)
+# ETFX (плечевые/инверсные + кастом)
 ETFX = sorted(set([
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
