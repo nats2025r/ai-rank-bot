@@ -1,6 +1,6 @@
 # bot_sp500_fixed.py
-# Telegram-бот: AI-моментум + ConfirmScore для SP127/ETFALL/ETFX
-# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
+# Telegram-бот: Моментум + ConfirmScore для SP250/ETFALL/ETFX (БЕЗ AI)
+# Требования: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
 import io
@@ -24,15 +24,17 @@ from telegram.error import Conflict
 
 # -------------------- ENV --------------------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-AI_CSV_URL = os.getenv("AI_CSV_URL", "none").strip()
-W_AI = float(os.getenv("W_AI", "0.0"))
 BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
 BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
-BENCH_CANDIDATES = ["SPY","QQQ","IWM","DIA","XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI"]
+# Кандидаты бенчмарков для SMART-режима
+BENCH_CANDIDATES = [
+    "SPY","QQQ","IWM","DIA",
+    "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
+]
 
-# -------------------- Надёжная загрузка цен --------------------
+# -------------------- НАДЁЖНАЯ ЗАГРУЗКА ЦЕН --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
 UA_POOL = [
@@ -46,11 +48,12 @@ def _new_session() -> requests.Session:
     s.headers.update({"User-Agent": random.choice(UA_POOL)})
     return s
 
-# Алиасы «капризных» тикеров у Yahoo
+# алиасы капризных тикеров Yahoo
 ALIAS: Dict[str, str] = {
-    "BRK.B": "BRK-B",
+    "BRK.B": "BRK-B",  # Berkshire Hathaway (клаcс B)
     "BF.B":  "BF-B",
-    "BITX":  "BITB",  # если BITX флапает
+    "BITX":  "BITB",
+    "XYZ":   "SQ",     # Block, Inc. (в S&P 500 сейчас как XYZ; у Yahoo — SQ)
 }
 
 def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
@@ -72,7 +75,6 @@ def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
         return df['Close']
 
 def _fetch_from_yahoo_csv(ticker: str) -> Optional[pd.Series]:
-    """Прямой CSV-эндпоинт Yahoo — часто работает, когда JSON API молчит."""
     t = ALIAS.get(ticker, ticker)
     end = int(time.time())
     start = end - 400 * 24 * 3600
@@ -88,7 +90,7 @@ def _fetch_from_yahoo_csv(ticker: str) -> Optional[pd.Series]:
             df = df.dropna(subset=["Date"]).set_index("Date").sort_index()
             col = "Adj Close" if "Adj Close" in df.columns else "Close"
             s = df[col].astype(float)
-            return s.rename(ticker) if not s.dropna().empty else None
+            return s if not s.dropna().empty else None
     except Exception as e:
         print(f"[yahoo-csv] fail {ticker}: {e}")
     return None
@@ -105,7 +107,7 @@ def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
         df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
         df = df.dropna(subset=["Date", "Close"]).set_index("Date").sort_index()
         s = df["Close"].astype(float)
-        return s.rename(ticker) if not s.dropna().empty else None
+        return s if not s.dropna().empty else None
     except Exception as e:
         print(f"[stooq] fail {ticker}: {e}")
         return None
@@ -167,7 +169,6 @@ def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
     data: List[pd.Series] = []
     bad: List[str] = []
-
     for tk in tickers:
         s = await asyncio.to_thread(_fetch_one_close, tk)
         if s is None or s.dropna().empty:
@@ -188,7 +189,7 @@ async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]
 
     raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
 
-# -------------------- Метрики --------------------
+# -------------------- МЕТРИКИ --------------------
 def pct_change(series: pd.Series, periods: int) -> float:
     if len(series) < periods + 1:
         return np.nan
@@ -227,41 +228,10 @@ def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
             best_corr = corr; best = b
     return best
 
-def load_ai_scores() -> Dict[str,float]:
-    if not AI_CSV_URL or AI_CSV_URL.lower() == "none":
-        return {}
-    try:
-        text = requests.get(AI_CSV_URL, timeout=10).text
-        out: Dict[str,float] = {}
-        for line in text.splitlines():
-            parts = [x.strip() for x in line.split(",")]
-            if len(parts) >= 2:
-                tk = parts[0].upper()
-                try:
-                    out[tk] = float(parts[1])
-                except:
-                    pass
-        return out
-    except Exception as e:
-        print(f"[AI CSV] fail: {e}")
-        return {}
-
-def composite_score(rs21_rel: pd.Series, rs63_rel: pd.Series, conf: pd.Series, ai: Dict[str,float]) -> pd.Series:
-    r1 = rank_pct(rs21_rel.fillna(-1))
-    r2 = rank_pct(rs63_rel.fillna(-1))
-    rc = conf.fillna(0)
-    base = 0.45*r1 + 0.35*r2 + 0.20*rc
-    if not ai or W_AI <= 0:
-        return base
-    ai_series = pd.Series({k:v for k,v in ai.items() if k in base.index})
-    if not ai_series.empty:
-        ai_norm = rank_pct(ai_series)
-        base.loc[ai_norm.index] = (1.0 - W_AI)*base.loc[ai_norm.index] + W_AI*ai_norm
-    return base
-
 def fmt_row(i, tk, row):
     return f"{i}) {tk} | score={row['score']:.4f} | RS21={row['rs21_rel']:+.2%} | RS63={row['rs63_rel']:+.2%} | conf={row['conf']:.2f}"
 
+# -------------------- РАНЖИРОВАНИЕ --------------------
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
     bench_need = {BENCH_DEFAULT}
@@ -272,7 +242,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
-        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo/Stooq). Попробуй ещё раз чуть позже.\nДетали: {e}")
+        await update.message.reply_text(f"Не получилось загрузить котировки. Попробуй ещё раз.\nДетали: {e}")
         return
 
     missing = [t for t in tickers if t not in closes.columns]
@@ -285,12 +255,12 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         await update.message.reply_text("Нечего ранжировать: нет данных по вселенной.")
         return
 
-    ai = load_ai_scores() if W_AI > 0 else {}
     rows = []
     for tk in uni:
         pr = closes[tk].dropna()
         if pr.empty:
             continue
+
         bench = pick_benchmark_for(tk, closes) if BENCH_MODE == "smart" else BENCH_DEFAULT
         if bench not in closes.columns:
             bench = BENCH_DEFAULT
@@ -307,16 +277,26 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             rs21_rel, rs63_rel = rs21, rs63
 
         conf = confirm_score(pr)
-        rows.append({"ticker": tk, "bench": bench, "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf})
+
+        rows.append({
+            "ticker": tk,
+            "bench": bench,
+            "rs21_rel": rs21_rel,
+            "rs63_rel": rs63_rel,
+            "conf": conf,
+        })
 
     df = pd.DataFrame(rows).set_index("ticker")
     if df.empty:
         await update.message.reply_text("Нет валидных данных после загрузки котировок.")
         return
 
-    df["score"] = composite_score(df["rs21_rel"], df["rs63_rel"], df["conf"], ai)
-    df_sorted = df.sort_values("score", ascending=False)
+    r1 = rank_pct(df["rs21_rel"].fillna(-1))
+    r2 = rank_pct(df["rs63_rel"].fillna(-1))
+    rc = df["conf"].fillna(0)
+    df["score"] = 0.45*r1 + 0.35*r2 + 0.20*rc
 
+    df_sorted = df.sort_values("score", ascending=False)
     if top_n:
         df_show = df_sorted.head(top_n)
         lines = [f"Топ {top_n} — {universe_name}, сортировка по score:"]
@@ -333,25 +313,40 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         if chunk:
             await update.message.reply_text("\n".join(chunk))
 
-# -------------------- ВСЕЛЕННЫЕ --------------------
-# SP127 (COIN включён)
+# -------------------- ЖЁСТКО ЗАШИТЫЕ ВСЕЛЕННЫЕ --------------------
+# SP250: TOP-250 S&P 500 по весу (Slickcharts, 2025-09-05)
 SP250 = """
-NVDA MSFT AAPL AMZN META GOOGL AVGO GOOG TSLA BRK.B
+NVDA MSFT AAPL AMZN META AVGO GOOGL GOOG BRK.B TSLA
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
-HD ABBV PLTR BAC PG CVX GE KO TMUS UNH
-CSCO AMD WFC PM CRM MS ABT IBM MCD AXP
-LIN GS MRK RTX DIS T PEP UBER CAT NOW
-INTU VZ TMO BKNG TXN BA SCHW C ANET BLK
-QCOM SPGI ACN ISRG BSX TJX AMGN ADBE NEE
-SYK LOW PGR DHR PFE COF GILD HON APH ETN
-MU UNP BX PANW DE CMCSA AMAT LRCX ADP KKR
-ADI COP MDT WELL MO NKE CB KLAC SNPS DASH
-INTC LMT PLD CRWD VRTX MMC SO ICE SBUX BMY
-CME RCL CEG HCA PH DUK CDNS CVS AMT SHW
-TT WM MCO ORLY GD MCK NEM COIN
+HD BAC ABBV PG PLTR CVX GE KO TMUS UNH
+CSCO AMD WFC PM MS CRM ABT IBM AXP GS
+MCD LIN DIS T RTX MRK PEP CAT UBER NOW
+VZ INTU TMO BKNG C ANET SCHW BA QCOM BLK
+TXN SPGI GEV ISRG BSX TJX ACN SYK AMGN LOW
+NEE PGR ADBE COF DHR GILD PFE MU APH HON
+ETN BX UNP PANW DE LRCX AMAT CMCSA
+KKR ADP ADI COP MDT KLAC WELL MO CB
+SNPS NKE INTC DASH LMT PLD CRWD MMC VRTX
+SO ICE SBUX RCL CEG CME PH CDNS
+BMY HCA DUK CVS TT AMT SHW WM
+MCO ORLY GD MCK DELL NOC CTAS MMM NEM
+AON CI PNC MSI COIN MDLZ AJG ECL
+ITW APO ABNB USB EMR EQIX BK FI RSG
+MAR TDG HWM UPS AZO WMB JCI ELV
+ADSK ZTS CL EOG FCX PYPL HLT APD VST
+URI NSC TRV MNST WDAY TEL CSX TFC
+REGN GLW KMI SPG FTNT AFL AEP FAST
+NXPI AXON ROP COR PWR DLR CMG CMI
+GM ALL BDX MET NDAQ MPC SRE CARR SLB
+O PSX FDX DHI PCAR PSA IDXX LHX ROST
+D CBRE AMP CTVA PAYX GWW VLO EW CPRT
+OKE F GRMN XYZ OXY DDOG BKR AIG KR
+TTWO EXC AME MSCI KMB CCL XEL EBAY EA
+TGT CCI FANG MPWR PEG YUM KDP DAL
+SYY RMD KVUE STX ETR VMC ROK PRU
 """.split()
 
-# ETFALL — добавлен MSTR
+# ETFALL (обычные; с MSTR по твоей просьбе)
 ETFALL = [
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
@@ -361,7 +356,7 @@ ETFALL = [
     "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX — плечевые/инверсные/одиночные (твои кастомные тоже)
+# ETFX (плечевые/инверсные + твои кастом)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
@@ -383,14 +378,14 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Bot: @{me.username} (id={me.id})\n"
         f"MODE={BENCH_MODE}  DEFAULT_BENCH={BENCH_DEFAULT}\n"
-        f"W_AI={W_AI}  TZ={BOT_TZ}"
+        f"TZ={BOT_TZ}"
     )
 
 async def sp5005_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await universe_rank(update, context, "SP127", SP250, top_n=5)
+    await universe_rank(update, context, "SP250", SP250, top_n=5)
 
 async def sp50010_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await universe_rank(update, context, "SP127", SP250, top_n=10)
+    await universe_rank(update, context, "SP250", SP250, top_n=10)
 
 async def etfall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFALL", ETFALL, top_n=10)
@@ -407,7 +402,6 @@ async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tickers = ETFX
     await universe_rank(update, context, name.upper(), tickers, top_n=None)
 
-# настройки
 async def benchmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global BENCH_MODE
     if context.args:
@@ -432,28 +426,6 @@ async def benchcandidates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def getbench_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Текущие настройки:\nMODE={BENCH_MODE}\nDEFAULT={BENCH_DEFAULT}")
 
-async def setaisource_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global AI_CSV_URL
-    if not context.args:
-        await update.message.reply_text("Формат: /setaisource <csv|none>\nПример: /setaisource https://.../ai_scores.csv")
-        return
-    AI_CSV_URL = context.args[0]
-    await update.message.reply_text(f"Источник AI: {AI_CSV_URL}")
-
-async def setw_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global W_AI
-    if not context.args:
-        await update.message.reply_text("Формат: /setw_ai <0..1>")
-        return
-    try:
-        val = float(context.args[0])
-        if 0.0 <= val <= 1.0:
-            W_AI = val; await update.message.reply_text(f"W_AI = {W_AI}")
-        else:
-            await update.message.reply_text("Допустимо 0..1")
-    except:
-        await update.message.reply_text("Не понял число. Пример: /setw_ai 0.2")
-
 # -------------------- ИНИЦИАЛИЗАЦИЯ --------------------
 async def _post_init(app: Application):
     try:
@@ -466,7 +438,13 @@ async def _post_init(app: Application):
 
 def build_app() -> Application:
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=60.0, write_timeout=30.0, pool_timeout=30.0)
-    app = (Application.builder().token(BOT_TOKEN).request(request).post_init(_post_init).build())
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(_post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("sp5005", sp5005_cmd))
@@ -478,8 +456,6 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("setbenchmark", setbenchmark_cmd))
     app.add_handler(CommandHandler("benchcandidates", benchcandidates_cmd))
     app.add_handler(CommandHandler("getbench", getbench_cmd))
-    app.add_handler(CommandHandler("setaisource", setaisource_cmd))
-    app.add_handler(CommandHandler("setw_ai", setw_ai_cmd))
     return app
 
 # -------------------- MAIN --------------------
