@@ -50,10 +50,10 @@ def _new_session() -> requests.Session:
 
 # алиасы капризных тикеров Yahoo
 ALIAS: Dict[str, str] = {
-    "BRK.B": "BRK-B",  # Berkshire Hathaway (клаcс B)
+    "BRK.B": "BRK-B",  # Berkshire Hathaway (класс B)
     "BF.B":  "BF-B",
     "BITX":  "BITB",
-    "XYZ":   "SQ",     # Block, Inc. (в S&P 500 сейчас как XYZ; у Yahoo — SQ)
+    "XYZ":   "SQ",     # Block, Inc.: у Yahoo тикер SQ
 }
 
 def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
@@ -233,7 +233,8 @@ def fmt_row(i, tk, row):
 
 # -------------------- РАНЖИРОВАНИЕ --------------------
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
-    await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
+    # (убрано сообщение «Считаю ... 20–30 сек»)
+
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
@@ -314,7 +315,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ЖЁСТКО ЗАШИТЫЕ ВСЕЛЕННЫЕ --------------------
-# SP250: TOP-250 S&P 500 по весу (Slickcharts, 2025-09-05)
+# SP250: TOP-250 S&P 500 по весу (порядок зашит)
 SP250 = """
 NVDA MSFT AAPL AMZN META AVGO GOOGL GOOG BRK.B TSLA
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
@@ -346,7 +347,7 @@ TGT CCI FANG MPWR PEG YUM KDP DAL
 SYY RMD KVUE STX ETR VMC ROK PRU
 """.split()
 
-# ETFALL (обычные; с MSTR по твоей просьбе)
+# ETFALL (обычные; с MSTR)
 ETFALL = [
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
@@ -356,7 +357,7 @@ ETFALL = [
     "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX (плечевые/инверсные + твои кастом)
+# ETFX (плечевые/инверсные + кастом)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
