@@ -1,11 +1,12 @@
 # bot_sp500_fixed.py
 # Telegram-бот: AI-моментум + ConfirmScore для SP127/ETFALL/ETFX
-# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
+# Требования: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
 import io
 import time
 import math
+import random
 import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -30,6 +31,7 @@ BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
 BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
+# Кандидаты бенчмарков для SMART-режима
 BENCH_CANDIDATES = [
     "SPY","QQQ","IWM","DIA",
     "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
@@ -38,14 +40,24 @@ BENCH_CANDIDATES = [
 # -------------------- Надёжная загрузка цен --------------------
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=False)
 
-YF_SESSION = requests.Session()
-YF_SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-})
+# Пул UA для обхода случайных блокировок
+UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15",
+]
 
+def _new_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": random.choice(UA_POOL)})
+    return s
+
+# Алиасы «капризных» тикеров у Yahoo
 ALIAS: Dict[str, str] = {
     "BRK.B": "BRK-B",
     "BF.B":  "BF-B",
+    # Если BITX чудит — можно подменить:
+    "BITX":  "BITB",
 }
 
 def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
@@ -85,8 +97,9 @@ def _fetch_from_stooq(ticker: str) -> Optional[pd.Series]:
 
 def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
     t = ALIAS.get(ticker, ticker)
+    sess = _new_session()
     try:
-        df = yf.download(t, session=YF_SESSION, **YF_OPTS)
+        df = yf.download(t, session=sess, **YF_OPTS)
         s = _normalize_yf_df(df, t)
         if s is not None and not s.dropna().empty:
             return s.rename(ticker)
@@ -94,7 +107,7 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
         print(f"[yfinance] fail {ticker} (1st): {e}")
     try:
         alt = dict(YF_OPTS); alt["period"] = "365d"
-        df = yf.download(t, session=YF_SESSION, **alt)
+        df = yf.download(t, session=_new_session(), **alt)
         s = _normalize_yf_df(df, t)
         if s is not None and not s.dropna().empty:
             return s.rename(ticker)
@@ -105,8 +118,39 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
         return s.rename(ticker)
     return None
 
+def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay: float = 3.0) -> Optional[pd.DataFrame]:
+    """Групповая загрузка: делим на пачки, несколько попыток с разными UA."""
+    for attempt in range(tries):
+        colls = []
+        sess = _new_session()
+        ok_any = False
+        for i in range(0, len(ticks), chunk):
+            part = ticks[i:i+chunk]
+            syms = " ".join([ALIAS.get(t, t) for t in part])
+            try:
+                df = yf.download(syms, session=sess, **YF_OPTS)
+                if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
+                    blk = df["Close"].copy()
+                    # вернуть исходные тикеры (без алиасов в именах)
+                    rename_map = {ALIAS.get(t, t): t for t in part}
+                    blk = blk.rename(columns=rename_map)
+                    blk = blk.loc[:, [t for t in part if t in blk.columns]]
+                    if not blk.empty:
+                        colls.append(blk); ok_any = True
+                elif "Close" in df.columns and len(part) == 1:
+                    s = df["Close"].rename(part[0])
+                    colls.append(pd.concat([s], axis=1)); ok_any = True
+            except Exception as e:
+                print(f"[bulk-chunk] fail {part}: {e}")
+            time.sleep(0.5)
+        if ok_any:
+            out = pd.concat(colls, axis=1)
+            return out.dropna(how="all")
+        time.sleep(delay)
+    return None
+
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    """Поштучно + троттлинг; при полном провале — bulk-fallback к Yahoo."""
+    """Сначала поштучно с троттлингом. При провале — bulk-попытка с ретраями."""
     data: List[pd.Series] = []
     bad: List[str] = []
 
@@ -116,29 +160,19 @@ async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]
             bad.append(tk)
         else:
             data.append(s)
-        pause = 0.05 if len(tickers) <= 50 else 0.10 if len(tickers) <= 100 else 0.15
+        # небольшая пауза: чем больше вселенная, тем больше пауза
+        pause = 0.07 if len(tickers) <= 50 else 0.12 if len(tickers) <= 100 else 0.18
         await asyncio.sleep(pause)
 
     if data:
         closes = pd.concat(data, axis=1).dropna(how="all").dropna(axis=1, how="all")
         return closes, bad
 
-    # bulk-fallback
-    try:
-        syms = " ".join([ALIAS.get(t, t) for t in tickers])
-        df_bulk = yf.download(syms, session=YF_SESSION, **YF_OPTS)
-        if isinstance(df_bulk.columns, pd.MultiIndex) and "Close" in df_bulk.columns.get_level_values(0):
-            close_block = df_bulk["Close"].copy()
-            rename_map = {ALIAS.get(k, k): k for k in tickers}
-            close_block = close_block.rename(columns=rename_map)
-            close_block = close_block.loc[:, [t for t in tickers if t in close_block.columns]]
-            if not close_block.empty:
-                return close_block.dropna(how="all"), tickers
-        elif "Close" in df_bulk.columns and len(tickers) == 1:
-            s = df_bulk["Close"].rename(tickers[0])
-            return pd.concat([s], axis=1), tickers
-    except Exception as e:
-        print(f"[bulk yfinance] fail: {e}")
+    # ничего не вышло — пробуем группами
+    bulk = _bulk_chunk_download(tickers, chunk=8, tries=3, delay=3.0)
+    if bulk is not None and not bulk.empty:
+        still_bad = [t for t in tickers if t not in bulk.columns]
+        return bulk, still_bad
 
     raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
 
@@ -218,6 +252,7 @@ def fmt_row(i, tk, row):
 
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
     await update.message.reply_text(f"Считаю {universe_name}... это ~20–30 сек на первом запуске.")
+    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
@@ -226,7 +261,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
     try:
         closes, bad = await load_close_matrix(use_tickers)
     except Exception as e:
-        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo/Stooq). Попробуй ещё раз.\nДетали: {e}")
+        await update.message.reply_text(f"Не получилось загрузить котировки (Yahoo/Stooq). Попробуй ещё раз чуть позже.\nДетали: {e}")
         return
 
     missing = [t for t in tickers if t not in closes.columns]
@@ -261,7 +296,10 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             rs21_rel, rs63_rel = rs21, rs63
 
         conf = confirm_score(pr)
-        rows.append({"ticker": tk, "bench": bench, "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf})
+        rows.append({
+            "ticker": tk, "bench": bench,
+            "rs21_rel": rs21_rel, "rs63_rel": rs63_rel, "conf": conf
+        })
 
     df = pd.DataFrame(rows).set_index("ticker")
     if df.empty:
@@ -288,7 +326,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-# Жёстко зашитый список SP127 (топ-127 S&P 500 по весу; COIN включён)
+# Жёстко зашитый список SP127 (COIN включён)
 SP250 = """
 NVDA MSFT AAPL AMZN META GOOGL AVGO GOOG TSLA BRK.B
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
@@ -359,6 +397,7 @@ async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFX", ETFX, top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /etf  или /etf etfall|etfx
     args = [a.lower() for a in context.args] if context.args else []
     name = "etfall"; tickers = ETFALL
     if args and args[0] in ("etfall","etfx"):
@@ -476,4 +515,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
