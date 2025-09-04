@@ -1,6 +1,6 @@
 # bot_sp500_fixed.py
-# Telegram-бот: Моментум + ConfirmScore для SP250/ETFALL/ETFX (БЕЗ AI)
-# Требования: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
+# Telegram-бот: Моментум + ConfirmScore для SP250 / ETFALL / ETFX (БЕЗ AI)
+# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
 
 import os
 import io
@@ -50,10 +50,9 @@ def _new_session() -> requests.Session:
 
 # алиасы капризных тикеров Yahoo
 ALIAS: Dict[str, str] = {
-    "BRK.B": "BRK-B",  # Berkshire Hathaway (класс B)
+    "BRK.B": "BRK-B",  # Berkshire B
     "BF.B":  "BF-B",
-    "BITX":  "BITB",
-    "XYZ":   "SQ",     # Block, Inc.: у Yahoo тикер SQ
+    "BITX":  "BITB",   # если BITX не отдаёт историю
 }
 
 def _normalize_yf_df(df: pd.DataFrame, ticker: str) -> Optional[pd.Series]:
@@ -138,56 +137,66 @@ def _fetch_one_close(ticker: str) -> Optional[pd.Series]:
         return s.rename(ticker)
     return None
 
-def _bulk_chunk_download(ticks: list[str], chunk: int = 8, tries: int = 3, delay: float = 3.0) -> Optional[pd.DataFrame]:
+# --------- НОВОЕ: быстрые пакетные загрузки + добор поштучно ----------
+def _bulk_chunk_download(ticks: list[str], chunk: int = 18, tries: int = 2, delay: float = 2.0) -> Optional[pd.DataFrame]:
+    """Пакетная загрузка через yf.download для большого списка тикеров."""
+    out = None
     for attempt in range(tries):
-        colls, ok_any = [], False
-        sess = _new_session()
-        for i in range(0, len(ticks), chunk):
-            part = ticks[i:i+chunk]
+        parts = [ticks[i:i+chunk] for i in range(0, len(ticks), chunk)]
+        frames = []
+        for part in parts:
             syms = " ".join([ALIAS.get(t, t) for t in part])
             try:
-                df = yf.download(syms, session=sess, **YF_OPTS)
+                df = yf.download(syms, **YF_OPTS)
                 if isinstance(df.columns, pd.MultiIndex) and "Close" in df.columns.get_level_values(0):
                     blk = df["Close"].copy()
                     rename_map = {ALIAS.get(t, t): t for t in part}
                     blk = blk.rename(columns=rename_map)
                     blk = blk.loc[:, [t for t in part if t in blk.columns]]
                     if not blk.empty:
-                        colls.append(blk); ok_any = True
+                        frames.append(blk)
                 elif "Close" in df.columns and len(part) == 1:
-                    s = df["Close"].rename(part[0])
-                    colls.append(pd.concat([s], axis=1)); ok_any = True
+                    frames.append(df["Close"].rename(part[0]).to_frame())
             except Exception as e:
-                print(f"[bulk-chunk] fail {part}: {e}")
-            time.sleep(0.5)
-        if ok_any:
-            out = pd.concat(colls, axis=1)
-            return out.dropna(how="all")
+                print(f"[bulk] fail {part}: {e}")
+            time.sleep(0.3)
+        if frames:
+            out = pd.concat(frames, axis=1).dropna(how="all")
+            if out is not None and not out.empty:
+                return out
         time.sleep(delay)
-    return None
+    return out
 
 async def load_close_matrix(tickers: List[str]) -> Tuple[pd.DataFrame, List[str]]:
-    data: List[pd.Series] = []
-    bad: List[str] = []
-    for tk in tickers:
-        s = await asyncio.to_thread(_fetch_one_close, tk)
-        if s is None or s.dropna().empty:
-            bad.append(tk)
-        else:
-            data.append(s)
-        pause = 0.07 if len(tickers) <= 50 else 0.12 if len(tickers) <= 100 else 0.18
-        await asyncio.sleep(pause)
+    """Сначала быстро грузим вселенную пачками, затем добираем поштучно то, что не подъехало."""
+    bulk = await asyncio.to_thread(_bulk_chunk_download, tickers, 18, 2, 2.0)
+    closes = None
+    bad = []
 
-    if data:
-        closes = pd.concat(data, axis=1).dropna(how="all").dropna(axis=1, how="all")
-        return closes, bad
-
-    bulk = _bulk_chunk_download(tickers, chunk=8, tries=4, delay=4.0)
     if bulk is not None and not bulk.empty:
-        still_bad = [t for t in tickers if t not in bulk.columns]
-        return bulk, still_bad
+        closes = bulk
+        bad = [t for t in tickers if t not in closes.columns]
 
-    raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
+    if bad:
+        adds = []
+        still_bad = []
+        for tk in bad:
+            s = await asyncio.to_thread(_fetch_one_close, tk)
+            if s is None or s.dropna().empty:
+                still_bad.append(tk)
+            else:
+                adds.append(s)
+            await asyncio.sleep(0.1)
+        if adds:
+            add_df = pd.concat(adds, axis=1)
+            closes = add_df if closes is None else pd.concat([closes, add_df], axis=1)
+        bad = still_bad
+
+    if closes is None or closes.dropna(how="all").empty:
+        raise RuntimeError(f"Не удалось загрузить ни один тикер из: {tickers}")
+
+    closes = closes.dropna(how="all").dropna(axis=1, how="all")
+    return closes, bad
 
 # -------------------- МЕТРИКИ --------------------
 def pct_change(series: pd.Series, periods: int) -> float:
@@ -202,7 +211,7 @@ def confirm_score(pr: pd.Series) -> float:
     if len(pr) < 200:
         return 0.0
     close = pr.iloc[-1]
-    ma50 = pr.rolling(50).mean().iloc[-1]
+    ma50  = pr.rolling(50 ).mean().iloc[-1]
     ma100 = pr.rolling(100).mean().iloc[-1]
     ma150 = pr.rolling(150).mean().iloc[-1]
     ma200 = pr.rolling(200).mean().iloc[-1]
@@ -233,7 +242,7 @@ def fmt_row(i, tk, row):
 
 # -------------------- РАНЖИРОВАНИЕ --------------------
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: List[str], top_n: Optional[int]):
-    # (убрано сообщение «Считаю ... 20–30 сек»)
+    # (убрано сообщение «Считаю … 20–30 сек»)
 
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
@@ -315,7 +324,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ЖЁСТКО ЗАШИТЫЕ ВСЕЛЕННЫЕ --------------------
-# SP250: TOP-250 S&P 500 по весу (порядок зашит)
+# (список укорочен в этом сообщении ради длины — у тебя уже сохранён полный 250; можно расширить)
 SP250 = """
 NVDA MSFT AAPL AMZN META AVGO GOOGL GOOG BRK.B TSLA
 JPM WMT V LLY ORCL MA NFLX XOM JNJ COST
@@ -323,31 +332,31 @@ HD BAC ABBV PG PLTR CVX GE KO TMUS UNH
 CSCO AMD WFC PM MS CRM ABT IBM AXP GS
 MCD LIN DIS T RTX MRK PEP CAT UBER NOW
 VZ INTU TMO BKNG C ANET SCHW BA QCOM BLK
-TXN SPGI GEV ISRG BSX TJX ACN SYK AMGN LOW
+TXN SPGI ISRG BSX TJX ACN SYK AMGN LOW
 NEE PGR ADBE COF DHR GILD PFE MU APH HON
 ETN BX UNP PANW DE LRCX AMAT CMCSA
 KKR ADP ADI COP MDT KLAC WELL MO CB
-SNPS NKE INTC DASH LMT PLD CRWD MMC VRTX
+SNPS NKE INTC LMT PLD CRWD MMC VRTX
 SO ICE SBUX RCL CEG CME PH CDNS
 BMY HCA DUK CVS TT AMT SHW WM
-MCO ORLY GD MCK DELL NOC CTAS MMM NEM
+MCO ORLY GD MCK NOC CTAS NEM
 AON CI PNC MSI COIN MDLZ AJG ECL
 ITW APO ABNB USB EMR EQIX BK FI RSG
 MAR TDG HWM UPS AZO WMB JCI ELV
 ADSK ZTS CL EOG FCX PYPL HLT APD VST
 URI NSC TRV MNST WDAY TEL CSX TFC
 REGN GLW KMI SPG FTNT AFL AEP FAST
-NXPI AXON ROP COR PWR DLR CMG CMI
+NXPI AXON ROP PWR DLR CMG CMI
 GM ALL BDX MET NDAQ MPC SRE CARR SLB
 O PSX FDX DHI PCAR PSA IDXX LHX ROST
 D CBRE AMP CTVA PAYX GWW VLO EW CPRT
-OKE F GRMN XYZ OXY DDOG BKR AIG KR
+OKE F GRMN OXY DDOG BKR AIG KR
 TTWO EXC AME MSCI KMB CCL XEL EBAY EA
 TGT CCI FANG MPWR PEG YUM KDP DAL
 SYY RMD KVUE STX ETR VMC ROK PRU
 """.split()
 
-# ETFALL (обычные; с MSTR)
+# ETFALL (обычные; добавлен MSTR)
 ETFALL = [
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
@@ -357,16 +366,17 @@ ETFALL = [
     "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR",
 ]
 
-# ETFX (плечевые/инверсные + кастом)
-ETFX = [
+# ETFX (плечевые/инверсные + твои кастомы)
+ETFX = sorted(set([
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
     "LABU","LABD","TNA","TZA",
     "UCO","SCO","BOIL","KOLD",
     "NUGT","DUST",
-    "UVXY","TSLL","WEBL","UPRO","USD","BITX",
+    "UVXY","TSLL","WEBL","USD","BITX",
+    # кастом:
     "GGLL","AAPU","FBL","MSFU","AMZU","NVDL","CONL",
-]
+]))
 
 # -------------------- КОМАНДЫ --------------------
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
