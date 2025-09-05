@@ -1,7 +1,7 @@
 # bot_sp500_fixed.py
 # Telegram-бот: AI-моментум + ConfirmScore для SP250/ETFALL/ETFX
-# ВАЖНО: здесь убраны «болтушки» про 20–30 сек и сделана надёжная загрузка цен
-# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests
+# Только рынок США. Устойчивый загрузчик котировок.
+# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests, pandas_datareader
 
 import os
 import math
@@ -16,6 +16,7 @@ import pandas as pd
 import yfinance as yf
 import requests
 from io import StringIO
+from pandas_datareader import data as pdr
 
 # telegram-bot
 from telegram import Update
@@ -29,71 +30,87 @@ BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()   # "global" | "sm
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
 # -------------------- Параметры загрузки котировок --------------------
-YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False, group_by="ticker", threads=True)
+YF_SESSION = requests.Session()
+YF_SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+})
+YF_OPTS = dict(
+    period="180d", interval="1d", auto_adjust=True, progress=False,
+    group_by="ticker", threads=False, session=YF_SESSION
+)
 
-# батч размер и паузы (мягко уходим от 429)
-BATCH_SIZE = 80                 # сколько тикеров за один мультизапрос yf.download
-BATCH_PAUSE = 1.2               # сек между мульти-батчами
-FALLBACK_GAP = 0.35             # сек между одиночными фоллбэками
+# батч размер и паузы (мягко уходим от 429/таймаутов), ретраи
+BATCH_SIZE = 18
+BATCH_PAUSE = 1.0
+RETRIES = 3
+FALLBACK_GAP = 0.35
 HTTP_TIMEOUT = 12
 
-# при желании можно подменять «капризные» тикеры на аналоги
+# -------------------- США-санитайзер --------------------
 ALIAS = {
-    # "BITX": "BITB",
-    # "USD": "USD",
+    # классы акций в формате Yahoo (дефис вместо точки)
+    "BRK.B": "BRK-B", "BRK.A": "BRK-A",
+    "BF.B": "BF-B", "BF.A": "BF-A",
+    "HEI.A": "HEI-A", "HEI.B": "HEI-B",
+    "GOOGLE": "GOOGL",
 }
+NON_US_SUFFIXES = (
+    ".DE",".F",".SW",".MI",".PA",".BR",".AS",".L",".VX",".TO",".V",
+    ".HK",".SS",".SZ",".KS",".KQ",".TW",".TWO",".SI",".BK",".IS",
+    ".SA",".MX",".VI",".HE",".ST",".OL",".MC",".TA"
+)
+US_DOT_WHITELIST = {"BRK.A","BRK.B","BF.A","BF.B","HEI.A","HEI.B"}
 
-# кандидаты бенчмарков для SMART-режима
-BENCH_CANDIDATES = [
-    "SPY","QQQ","IWM","DIA",
-    "XLK","XLY","XLF","XLP","XLV","XLU","XLB","XLC","XLE","XLI",
-]
+def sanitize_us_tickers(tickers: list[str]) -> list[str]:
+    out = []
+    for t in tickers:
+        t0 = t.upper().strip()
+        if any(t0.endswith(suf) for suf in NON_US_SUFFIXES):
+            continue
+        if "." in t0 and t0 not in US_DOT_WHITELIST:
+            continue
+        t1 = ALIAS.get(t0, t0.replace(".", "-"))
+        out.append(t1)
+    seen = set(); uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x); uniq.append(x)
+    return uniq
 
 # -------------------- анти-дубли --------------------
 RECENT_MSG_IDS = deque(maxlen=500)
-
 def seen_message(update: Update) -> bool:
     mid = getattr(update.message, "message_id", None)
-    if mid is None:
-        return False
-    if mid in RECENT_MSG_IDS:
-        return True
-    RECENT_MSG_IDS.append(mid)
-    return False
+    if mid is None: return False
+    if mid in RECENT_MSG_IDS: return True
+    RECENT_MSG_IDS.append(mid); return False
 
 # -------------------- котировки --------------------
 def _parse_close_from_multi(df: pd.DataFrame, orig_tickers: list[str]) -> pd.DataFrame:
-    """
-    Из результата yf.download(list_of_tickers) вытащить матрицу Close.
-    """
     if df is None or df.empty:
         return pd.DataFrame()
-    # yfinance для мульти выдает столбцы вида ('Close','AAPL'), ('Close','MSFT'), ...
     if isinstance(df.columns, pd.MultiIndex):
-        if 'Close' in df.columns.get_level_values(0):
-            close = df['Close'].copy()
-            # сохранить порядок тикеров насколько возможно
-            cols = [c for c in orig_tickers if c in close.columns]
-            close = close[cols] if cols else close
-            return close
-        else:
+        level0 = df.columns.get_level_values(0)
+        use_level = 'Adj Close' if 'Adj Close' in level0 else ('Close' if 'Close' in level0 else None)
+        if use_level is None:
             return pd.DataFrame()
+        close = df[use_level].copy()
+        cols = [c for c in orig_tickers if c in close.columns]
+        return close[cols] if cols else close
     else:
-        # одиночный фрейм, а не мульти
-        if 'Close' in df.columns:
-            # имя колонки одно — подменим на исходный тикер, если он один
-            out = df[['Close']].copy()
+        col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
+        if col:
+            out = df[[col]].copy()
             if len(orig_tickers) == 1:
                 out.columns = [orig_tickers[0]]
             return out
         return pd.DataFrame()
 
 def _fallback_yahoo_csv(ticker: str) -> pd.Series | None:
-    """
-    Запасной путь: CSV /v7/finance/download с хедерами.
-    """
     t = ALIAS.get(ticker, ticker)
-    url = "https://query1.finance.yahoo.com/v7/finance/download/{}".format(t)
+    url = f"https://query1.finance.yahoo.com/v7/finance/download/{t}"
     params = {
         "period1": int(time.time()) - 210*24*3600,
         "period2": int(time.time()),
@@ -101,75 +118,100 @@ def _fallback_yahoo_csv(ticker: str) -> pd.Series | None:
         "events": "history",
         "includeAdjustedClose": "true"
     }
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv, */*;q=0.1",
-        "Connection": "close",
-    }
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=HTTP_TIMEOUT)
-        if r.status_code != 200 or not r.text or "Timestamp" in r.text:
+        r = YF_SESSION.get(url, params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200 or not r.text:
             return None
         df = pd.read_csv(StringIO(r.text))
-        if df.empty or "Close" not in df.columns:
-            return None
-        s = pd.Series(df["Close"].values, index=pd.to_datetime(df["Date"]), name=ticker)
+        if df.empty: return None
+        col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
+        if col is None: return None
+        s = pd.Series(df[col].values, index=pd.to_datetime(df["Date"]), name=ticker)
         return s
     except Exception as e:
         print(f"[yahoo-csv] fail {ticker}: {e}")
         return None
 
-def _fetch_one_close_strict(ticker: str) -> pd.Series | None:
-    """
-    Одна попытка через yfinance.download; если пусто — CSV фоллбэк.
-    """
+def _fallback_stooq(ticker: str) -> pd.Series | None:
+    try:
+        s = pdr.get_data_stooq(f"{ticker.lower()}.us")
+        if s is None or s.empty or "Close" not in s.columns:
+            return None
+        out = s["Close"].rename(ticker).sort_index()
+        out.index = pd.to_datetime(out.index)
+        return out
+    except Exception as e:
+        print(f"[stooq] fail {ticker}: {e}")
+        return None
+
+def _trim_incomplete_daily(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        ny = ZoneInfo("America/New_York")
+        now = datetime.now(ny)
+        if df.empty:
+            return df
+        last_date = df.index.max().date()
+        if last_date == now.date() and now.hour < 23:
+            return df.iloc[:-1]
+        return df
+    except Exception:
+        return df
+
+async def _fetch_one_close_strict(ticker: str) -> pd.Series | None:
     t = ALIAS.get(ticker, ticker)
     try:
-        df = yf.download(t, **YF_OPTS)
+        df = await asyncio.to_thread(yf.download, t, **YF_OPTS)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
-                if 'Close' in df.columns.get_level_values(0):
-                    s = df['Close']
+                lvl0 = df.columns.get_level_values(0)
+                use = 'Adj Close' if 'Adj Close' in lvl0 else ('Close' if 'Close' in lvl0 else None)
+                if use:
+                    s = df[use]
                     if isinstance(s, pd.DataFrame):
                         s = s.iloc[:, 0]
                     return s.rename(ticker)
-            elif 'Close' in df.columns:
-                return df['Close'].rename(ticker)
+            else:
+                col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
+                if col:
+                    return df[col].rename(ticker)
     except Exception as e:
         print(f"[yfinance] single fail {ticker}: {e}")
-
-    # fallback
     s = _fallback_yahoo_csv(t)
-    return s
+    if s is not None and not s.dropna().empty:
+        return s
+    return _fallback_stooq(ticker)
 
 async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    """
-    1) Пытаемся загрузить ВСЕ тикеры мультибатчами (минимум запросов)
-    2) Для недогруженных — индивидуальный фоллбэк с паузой
-    """
     need = [ALIAS.get(t, t) for t in tickers]
-    got = []
-    frames = []
+    got, frames = [], []
+
     for i in range(0, len(need), BATCH_SIZE):
         batch = need[i:i+BATCH_SIZE]
-        try:
-            df = yf.download(batch, **YF_OPTS)
-            close = _parse_close_from_multi(df, batch)
-            if not close.empty:
-                frames.append(close)
-                got.extend(list(close.columns))
-        except Exception as e:
-            print(f"[yfinance-multi] fail batch {batch[:3]}..: {e}")
+        last_err = None
+        for attempt in range(RETRIES):
+            try:
+                df = await asyncio.to_thread(yf.download, batch, **YF_OPTS)
+                close = _parse_close_from_multi(df, batch)
+                if not close.empty:
+                    frames.append(close)
+                    got.extend(list(close.columns))
+                break
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(BATCH_PAUSE * (2 ** attempt))
+        if last_err:
+            print(f"[yfinance-multi] batch {batch[:3]}.. err: {last_err}")
         await asyncio.sleep(BATCH_PAUSE)
 
     closes = pd.concat(frames, axis=1) if frames else pd.DataFrame()
-    closes = closes.loc[:, ~closes.columns.duplicated()] if not closes.empty else closes
+    if not closes.empty:
+        closes = closes.loc[:, ~closes.columns.duplicated()]
+        closes = _trim_incomplete_daily(closes)
 
-    # кто не загрузился — пробуем по одному
     missing_orig = [t for t in tickers if ALIAS.get(t, t) not in got]
     truly_bad = []
     for tk in missing_orig:
-        s = _fetch_one_close_strict(tk)
+        s = await _fetch_one_close_strict(tk)
         if s is None or s.dropna().empty:
             truly_bad.append(tk)
         else:
@@ -234,25 +276,23 @@ def fmt_row(i, tk, row):
 
 # -------------------- Ранжирование вселенной --------------------
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: list[str], top_n: int | None):
-    # анти-дубль
     if seen_message(update):
         return
 
-    # добавим бенчмарки к загрузке
     bench_need = {BENCH_DEFAULT}
     if BENCH_MODE == "smart":
         bench_need.update(BENCH_CANDIDATES)
-    use_tickers = sorted(set([t.upper() for t in tickers] + list(bench_need)))
+
+    use_tickers_raw = [t.upper() for t in tickers] + list(bench_need)
+    use_tickers = sanitize_us_tickers(sorted(set(use_tickers_raw)))
 
     closes, bad = await load_close_matrix(use_tickers)
 
-    # отдадим предупреждение, но не валимся
     miss_for_universe = [t for t in tickers if t not in closes.columns]
     bad_all = sorted(set(bad + miss_for_universe))
     if bad_all:
         await update.message.reply_text("⚠️ Пропущены тикеры без данных: " + ", ".join(bad_all))
 
-    # реальная вселенная
     uni = [t for t in tickers if t in closes.columns]
     if not uni:
         await update.message.reply_text("Нет данных для ранжирования (источник котировок недоступен).")
@@ -268,19 +308,28 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         if bench not in closes.columns:
             bench = BENCH_DEFAULT
 
-        rs21 = pct_change(pr, 21)
-        rs63 = pct_change(pr, 63)
-
+        # выравниваем последнюю дату
+        last_day = pr.index.max()
         if bench in closes.columns:
             bpr = closes[bench].dropna()
-            brs21 = pct_change(bpr, 21)
-            brs63 = pct_change(bpr, 63)
+            last_day = min(last_day, bpr.index.max())
+            pr_use = pr.loc[:last_day]
+            bpr_use = bpr.loc[:last_day]
+        else:
+            pr_use = pr
+            bpr_use = None
+
+        rs21 = pct_change(pr_use, 21)
+        rs63 = pct_change(pr_use, 63)
+        if bpr_use is not None:
+            brs21 = pct_change(bpr_use, 21)
+            brs63 = pct_change(bpr_use, 63)
             rs21_rel = (rs21 - brs21) if pd.notna(rs21) and pd.notna(brs21) else np.nan
             rs63_rel = (rs63 - brs63) if pd.notna(rs63) and pd.notna(brs63) else np.nan
         else:
             rs21_rel, rs63_rel = rs21, rs63
 
-        conf = confirm_score(pr)
+        conf = confirm_score(pr_use)
 
         rows.append({
             "ticker": tk,
@@ -317,47 +366,81 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
             await update.message.reply_text("\n".join(chunk))
 
 # -------------------- ВСЕЛЕННЫЕ --------------------
-# Вставь сюда свой «жёсткий» список (127 или 250) — одной строкой, как тебе нужно:
-SP250 = """
-AAPL MSFT NVDA AMZN GOOGL GOOG META AVGO LLY BRK.B JPM XOM UNH JNJ V MA TSLA ORCL PG COST MRK
-ABBV HD PEP KO BAC WMT NFLX ADBE CRM TMO CSCO ACN DHR LIN WFC AMD MCD TXN ABT IBM AXP CAT GE
-CVX AMGN NKE COP LMT QCOM PM NOW HON SBUX T RTX TGT SPGI GS ADP MDT LOW BKNG PGR C GILD ELV
-DE SYK MU PLD ISRG LRCX INTU ZTS PANW MS BLK REGN USB MO PEP^ QQQ^ (заметка: заменишь на свой окончательный список)
-""".split()
 
-# ETFALL — базовые «обычные» ETF (добавлен MSTR по твоей просьбе)
+# SP250 — 250 тикеров из S&P 500 (только США), захардкожено
+SP250 = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","AVGO","LLY","JPM",
+    "XOM","UNH","JNJ","V","MA","TSLA","ORCL","PG","COST","MRK",
+    "ABBV","HD","PEP","KO","BAC","WMT","NFLX","ADBE","CRM","TMO",
+    "CSCO","DHR","WFC","AMD","MCD","TXN","ABT","IBM","AXP","CAT",
+    "GE","CVX","AMGN","NKE","COP","LMT","QCOM","PM","NOW","HON",
+    "SBUX","RTX","TGT","SPGI","GS","ADP","MDT","LOW","BKNG","PGR",
+    "C","GILD","ELV","DE","SYK","MU","PLD","ISRG","LRCX","INTU",
+    "ZTS","PANW","MS","BLK","REGN","USB","MDLZ","BK","MRNA","VRTX",
+    "CI","HUM","CVS","BDX","EW","BSX","ZBH","HCA","DGX","LH",
+    "ILMN","IDXX","IQV","WST","MCK","CAH","DXCM","ALGN","TFC","PNC",
+    "COF","DFS","FITB","KEY","RF","HBAN","CFG","MTB","NTRS","STT",
+    "CME","ICE","CBOE","MKTX","MSCI","NDAQ","AIG","ALL","CB","TRV",
+    "MET","PRU","PFG","AFL","CINF","HIG","MMC","WTW","BRO","BRK-B",
+    "UPS","FDX","UNP","CSX","NSC","ODFL","JBHT","EXPD","CHRW","DAL",
+    "AAL","UAL","LUV","CHTR","CMCSA","DIS","T","VZ","TMUS","PARA",
+    "WBD","FOXA","EA","TTWO","PYPL","ADSK","ANSS","CDNS","SNPS","FTNT",
+    "CRWD","WDAY","INTC","HPQ","DELL","HPE","AMAT","KLAC","TER","ON",
+    "MCHP","MPWR","SWKS","QRVO","QCOM","FSLR","ENPH","APH","TEL","PH",
+    "ETN","EMR","ITW","GD","NOC","LHX","HII","BA","MMM","ROP",
+    "CARR","JCI","IR","FTV","DOV","ROK","AME","FAST","GWW","TDG",
+    "WHR","NUE","STLD","CLF","MLM","VMC","FCX","ALB","APD","ECL",
+    "SHW","PPG","DOW","DD","EMN","NEM","CF","MOS","FMC","BALL",
+    "IP","PKG","WRK","AVY","IEX","NEE","SO","DUK","AEP","D",
+    "EXC","SRE","ED","PEG","XEL","EIX","ES","AEE","NRG","WEC",
+    "CMS","FE","CEG","MPC","VLO","PSX","KMI","WMB","OKE","LNG",
+    "BKR","SLB","HAL","OXY","HES","EOG","PXD","FANG","CTRA","DVN",
+    "MRO","APA","AMT","CCI","EQIX","DLR","SPG","O","PSA","WELL",
+    "VTR","AVB","EQR","ESS","UDR","CPT","INVH","AMH","VICI","HST",
+    "KIM","FRT","REG","BXP","WY","NVR","LEN","DHI","PHM","TOL",
+    "CPRT","KMX","ORLY","AZO","ROST","TJX","DG","DLTR","HAS","HLT",
+    "MAR","MGM","DRI","YUM","CMG","DPZ","NKE","VFC","PVH","RL",
+    "TAP","STZ","BF-B","KHC","GIS","CPB","CLX","CL","KMB","CHD",
+    "HSY","SJM","CAG","MKC","SYY","KR","ADM","BG","TSN","HRL",
+    "WMT","COST","TGT"
+]
+
+# ETFALL — базовые ETF (США)
 ETFALL = [
     "SPY","VOO","IVV","RSP","QQQ","DIA","IWM","IWB","IWR","IJR",
     "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
     "TLT","IEF","HYG","LQD","AGG","BND",
     "GLD","IAU","SLV","GDX",
     "SMH","SOXX","IBB","XBI","ITB","XHB","IYT","XOP","XME","XRT",
-    "BITO","LIT","MAGS","ARKK","KRE","KBE",
-    "MSTR"  # <— добавлен
+    "BITO","LIT","MAGS","ARKK","KRE","KBE","MSTR"
 ]
 
-# ETFX — плечевые/инверсные/одиночные (с твоими доп. тикерами)
+# ETFX — плечевые/инверсные/одиночные (UPRO один раз)
 ETFX = [
     "TQQQ","SQQQ","SPXL","SPXS","UPRO","SPXU","UDOW","SDOW",
     "SOXL","SOXS","TECL","TECS","FNGU","FNGD",
     "LABU","LABD","TNA","TZA",
     "UCO","SCO","BOIL","KOLD",
     "NUGT","DUST","UVXY",
-    "TSLL","WEBL","UPRO","USD","BITX",
+    "TSLL","WEBL","USD","BITX",
     "GGLL","AAPU","FBL","MSFU","AMZU","NVDL","CONL"
+]
+
+# Кандидаты бенчмарков для SMART-режима
+BENCH_CANDIDATES = [
+    "SPY","QQQ","IWM","DIA",
+    "XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC",
 ]
 
 # -------------------- КОМАНДЫ --------------------
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     tz = ZoneInfo(BOT_TZ)
     now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
     await update.message.reply_text(f"Я на связи ✅\n{now} {BOT_TZ}")
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     me = await context.bot.get_me()
     await update.message.reply_text(
         f"Bot: @{me.username} (id={me.id})\nMODE={BENCH_MODE}  DEFAULT_BENCH={BENCH_DEFAULT}\nTZ={BOT_TZ}"
@@ -376,11 +459,9 @@ async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, "ETFX", ETFX, top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     args = [a.lower() for a in context.args] if context.args else []
-    name = "etfall"
-    tickers = ETFALL
+    name = "etfall"; tickers = ETFALL
     if args and args[0] in ("etfall","etfx"):
         name = args[0]
     if name == "etfx":
@@ -388,8 +469,7 @@ async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await universe_rank(update, context, name.upper(), tickers, top_n=None)
 
 async def benchmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     global BENCH_MODE
     if context.args:
         mode = context.args[0].lower().strip()
@@ -400,8 +480,7 @@ async def benchmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Формат: /benchmode <global|smart>")
 
 async def setbenchmark_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     global BENCH_DEFAULT
     if not context.args:
         await update.message.reply_text("Формат: /setbenchmark <тикер>")
@@ -410,8 +489,7 @@ async def setbenchmark_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Глобальный бенч: {BENCH_DEFAULT}")
 
 async def benchcandidates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if seen_message(update):
-        return
+    if seen_message(update): return
     await update.message.reply_text("Кандидаты SMART:\n" + " ".join(BENCH_CANDIDATES))
 
 # -------------------- MAIN --------------------
@@ -433,7 +511,6 @@ def main() -> None:
     app.add_handler(CommandHandler("setbenchmark", setbenchmark_cmd))
     app.add_handler(CommandHandler("benchcandidates", benchcandidates_cmd))
 
-    # drop_pending_updates=True — чтобы при рестарте не «доглатывал» старые
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
