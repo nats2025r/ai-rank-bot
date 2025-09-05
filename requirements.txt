@@ -1,20 +1,8 @@
-pip>=24.2
-setuptools>=70
-wheel>=0.43.0
-
-# ядро (под Py 3.11 с готовыми wheels)
-numpy==1.26.4
-pandas==2.2.2
-yfinance==0.2.43
-requests==2.32.3
-
-# парсинг HTML для pandas.read_html (нужно для slickcharts)
-lxml==5.2.2
-html5lib==1.1
-beautifulsoup4==4.12.3
-
-# веб и бот
-Flask==3.0.3
 python-telegram-bot==20.7
-python-dotenv==1.0.1
-waitress==2.1.2
+yfinance==0.2.43
+pandas==2.2.2
+numpy==1.26.4
+requests>=2.31
+lxml
+beautifulsoup4
+pandas_datareader==0.10.0
