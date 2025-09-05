@@ -1,7 +1,9 @@
 # bot_sp500_fixed.py
 # Telegram-бот: AI-моментум + ConfirmScore для SP250/ETFALL/ETFX
-# Только рынок США. Устойчивый загрузчик котировок.
-# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4, lxml, bs4, requests, pandas_datareader
+# Только рынок США. Устойчивый загрузчик котировок (мелкие батчи, ретраи, CSV+Stooq фолбэк).
+# Исправлено: НЕТ group_by="ticker" (ломал мультизагрузку ETF), универсальный парсер MultiIndex.
+# Зависимости: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4,
+#              requests>=2.31, lxml, beautifulsoup4, pandas_datareader==0.10.0
 
 import os
 import math
@@ -10,17 +12,16 @@ import asyncio
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from collections import deque
+from io import StringIO
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
-from io import StringIO
 from pandas_datareader import data as pdr
 
 # telegram-bot
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # -------------------- ENV --------------------
@@ -37,20 +38,21 @@ YF_SESSION.headers.update({
     "Connection": "keep-alive",
 })
 YF_OPTS = dict(
-    period="180d", interval="1d", auto_adjust=True, progress=False,
-    group_by="ticker", threads=False, session=YF_SESSION
+    period="180d",
+    interval="1d",
+    auto_adjust=True,
+    progress=False,
+    threads=False,           # меньше 429
+    session=YF_SESSION       # свой UA/keep-alive
 )
-
-# батч размер и паузы (мягко уходим от 429/таймаутов), ретраи
 BATCH_SIZE = 18
 BATCH_PAUSE = 1.0
 RETRIES = 3
-FALLBACK_GAP = 0.35
+FALLBACK_GAP = 0.8
 HTTP_TIMEOUT = 12
 
 # -------------------- США-санитайзер --------------------
 ALIAS = {
-    # классы акций в формате Yahoo (дефис вместо точки)
     "BRK.B": "BRK-B", "BRK.A": "BRK-A",
     "BF.B": "BF-B", "BF.A": "BF-A",
     "HEI.A": "HEI-A", "HEI.B": "HEI-B",
@@ -73,6 +75,7 @@ def sanitize_us_tickers(tickers: list[str]) -> list[str]:
             continue
         t1 = ALIAS.get(t0, t0.replace(".", "-"))
         out.append(t1)
+    # уникальность с сохранением порядка
     seen = set(); uniq = []
     for x in out:
         if x not in seen:
@@ -89,28 +92,38 @@ def seen_message(update: Update) -> bool:
 
 # -------------------- котировки --------------------
 def _parse_close_from_multi(df: pd.DataFrame, orig_tickers: list[str]) -> pd.DataFrame:
+    """
+    Универсальный разбор ответа yf.download для списка тикеров.
+    Поддерживает ('Close','SPY') и ('SPY','Close').
+    """
     if df is None or df.empty:
         return pd.DataFrame()
+
     if isinstance(df.columns, pd.MultiIndex):
-        level0 = df.columns.get_level_values(0)
-        use_level = 'Adj Close' if 'Adj Close' in level0 else ('Close' if 'Close' in level0 else None)
-        if use_level is None:
+        lvl0 = df.columns.get_level_values(0)
+        lvl1 = df.columns.get_level_values(1)
+        if 'Close' in lvl0 or 'Adj Close' in lvl0:
+            use = 'Adj Close' if 'Adj Close' in lvl0 else 'Close'
+            close = df.xs(use, axis=1, level=0)
+        elif 'Close' in lvl1 or 'Adj Close' in lvl1:
+            use = 'Adj Close' if 'Adj Close' in lvl1 else 'Close'
+            close = df.xs(use, axis=1, level=1)
+        else:
             return pd.DataFrame()
-        close = df[use_level].copy()
         cols = [c for c in orig_tickers if c in close.columns]
         return close[cols] if cols else close
-    else:
-        col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
-        if col:
-            out = df[[col]].copy()
-            if len(orig_tickers) == 1:
-                out.columns = [orig_tickers[0]]
-            return out
+
+    # одиночный тикер
+    col = 'Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
+    if not col:
         return pd.DataFrame()
+    out = df[[col]].copy()
+    if len(orig_tickers) == 1:
+        out.columns = [orig_tickers[0]]
+    return out
 
 def _fallback_yahoo_csv(ticker: str) -> pd.Series | None:
-    t = ALIAS.get(ticker, ticker)
-    url = f"https://query1.finance.yahoo.com/v7/finance/download/{t}"
+    url = f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
     params = {
         "period1": int(time.time()) - 210*24*3600,
         "period2": int(time.time()),
@@ -123,9 +136,11 @@ def _fallback_yahoo_csv(ticker: str) -> pd.Series | None:
         if r.status_code != 200 or not r.text:
             return None
         df = pd.read_csv(StringIO(r.text))
-        if df.empty: return None
+        if df.empty:
+            return None
         col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
-        if col is None: return None
+        if col is None:
+            return None
         s = pd.Series(df[col].values, index=pd.to_datetime(df["Date"]), name=ticker)
         return s
     except Exception as e:
@@ -158,15 +173,14 @@ def _trim_incomplete_daily(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 async def _fetch_one_close_strict(ticker: str) -> pd.Series | None:
-    t = ALIAS.get(ticker, ticker)
     try:
-        df = await asyncio.to_thread(yf.download, t, **YF_OPTS)
+        df = await asyncio.to_thread(yf.download, ticker, **YF_OPTS)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 lvl0 = df.columns.get_level_values(0)
                 use = 'Adj Close' if 'Adj Close' in lvl0 else ('Close' if 'Close' in lvl0 else None)
-                if use:
-                    s = df[use]
+                s = df[use] if use else None
+                if s is not None:
                     if isinstance(s, pd.DataFrame):
                         s = s.iloc[:, 0]
                     return s.rename(ticker)
@@ -176,13 +190,14 @@ async def _fetch_one_close_strict(ticker: str) -> pd.Series | None:
                     return df[col].rename(ticker)
     except Exception as e:
         print(f"[yfinance] single fail {ticker}: {e}")
-    s = _fallback_yahoo_csv(t)
+
+    s = _fallback_yahoo_csv(ticker)
     if s is not None and not s.dropna().empty:
         return s
     return _fallback_stooq(ticker)
 
 async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    need = [ALIAS.get(t, t) for t in tickers]
+    need = tickers[:]  # уже санитайзены выше
     got, frames = [], []
 
     for i in range(0, len(need), BATCH_SIZE):
@@ -208,7 +223,7 @@ async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]
         closes = closes.loc[:, ~closes.columns.duplicated()]
         closes = _trim_incomplete_daily(closes)
 
-    missing_orig = [t for t in tickers if ALIAS.get(t, t) not in got]
+    missing_orig = [t for t in tickers if t not in got]
     truly_bad = []
     for tk in missing_orig:
         s = await _fetch_one_close_strict(tk)
