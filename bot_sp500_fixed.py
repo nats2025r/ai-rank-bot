@@ -1,6 +1,8 @@
 # bot_sp500_fixed.py
 # AI-моментум + ConfirmScore для SP250/ETFALL/ETFX (только США)
-# Надёжная загрузка: yfinance (батчи, быстрый таймаут) -> Stooq CSV (параллельно) -> Yahoo CSV (параллельно)
+# Загрузка цен: Stooq CSV (параллельно) -> Yahoo CSV (параллельно) -> yfinance single (опционально)
+# Требования: python-telegram-bot==20.7, yfinance==0.2.43, pandas==2.2.2, numpy==1.26.4,
+#             requests>=2.31, beautifulsoup4, lxml, pandas_datareader==0.10.0
 
 import os, math, time, asyncio, logging
 from datetime import datetime
@@ -12,7 +14,6 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
-from pandas_datareader import data as pdr  # оставил как резерв
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -20,25 +21,24 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # ---------- лог ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("ai-rank-bot")
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 # ---------- ENV ----------
 BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 BENCH_DEFAULT = os.getenv("BENCH_DEFAULT", "SPY").strip().upper()
-BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()
+BENCH_MODE = os.getenv("BENCH_MODE", "smart").strip().lower()  # "global" | "smart"
 BOT_TZ = os.getenv("BOT_TZ", "Europe/Berlin")
 
 # ---------- загрузка котировок ----------
 YF_SESSION = requests.Session()
-YF_SESSION.headers.update({"User-Agent":"Mozilla/5.0","Accept":"*/*","Connection":"keep-alive"})
+YF_SESSION.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Connection": "keep-alive"})
 YF_OPTS = dict(period="180d", interval="1d", auto_adjust=True, progress=False,
-               threads=False, session=YF_SESSION)  # БЕЗ group_by!
-
-BATCH_SIZE = 12            # маленькие батчи
-BATCH_PAUSE = 0.8
-YF_BATCH_TIMEOUT = 8       # сек на один мульти-батч
-RETRIES = 2
-HTTP_TIMEOUT = 6           # короткие таймауты сокета, чтобы не «висеть»
-CONCURRENCY = 12           # параллель для CSV-фоллбэков
+               threads=False, session=YF_SESSION)  # ВАЖНО: без group_by!
+CONCURRENCY = 12         # параллель CSV
+HTTP_TIMEOUT = 6         # короткие сокет-таймауты
+YF_SINGLE_TIMEOUT = 8    # таймаут одиночного yfinance
+YF_PRIMARY = False       # использовать ли yfinance как резерв (True) или полностью выключить (False)
 
 # ---------- США-санитайзер ----------
 ALIAS = {"BRK.B":"BRK-B","BRK.A":"BRK-A","BF.B":"BF-B","BF.A":"BF-A","HEI.A":"HEI-A","HEI.B":"HEI-B","GOOGLE":"GOOGL"}
@@ -65,35 +65,7 @@ def seen_message(update: Update) -> bool:
     if mid in RECENT_MSG_IDS: return True
     RECENT_MSG_IDS.append(mid); return False
 
-# ---------- утилиты загрузки ----------
-def _parse_close_from_multi(df: pd.DataFrame, orig_tickers: list[str]) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        lvl0=df.columns.get_level_values(0); lvl1=df.columns.get_level_values(1)
-        if 'Close' in lvl0 or 'Adj Close' in lvl0:
-            use='Adj Close' if 'Adj Close' in lvl0 else 'Close'
-            close=df.xs(use, axis=1, level=0)
-        elif 'Close' in lvl1 or 'Adj Close' in lvl1:
-            use='Adj Close' if 'Adj Close' in lvl1 else 'Close'
-            close=df.xs(use, axis=1, level=1)
-        else: return pd.DataFrame()
-        cols=[c for c in orig_tickers if c in close.columns]
-        return close[cols] if cols else close
-    col='Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
-    if not col: return pd.DataFrame()
-    out=df[[col]].copy()
-    if len(orig_tickers)==1: out.columns=[orig_tickers[0]]
-    return out
-
-def _trim_incomplete_daily(df: pd.DataFrame) -> pd.DataFrame:
-    try:
-        ny=ZoneInfo("America/New_York"); now=datetime.now(ny)
-        if df.empty: return df
-        if df.index.max().date()==now.date() and now.hour<23: return df.iloc[:-1]
-        return df
-    except Exception: return df
-
-# --- CSV-фоллбэки (параллельные) ---
+# ---------- утилиты CSV ----------
 def _stooq_csv_url(ticker: str) -> str:
     return f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
 
@@ -108,8 +80,7 @@ async def _fetch_csv_one(session: requests.Session, url: str, params: dict|None,
         r = await asyncio.to_thread(session.get, url, params=params, timeout=HTTP_TIMEOUT)
         if r.status_code!=200 or not r.text: return None
         df = pd.read_csv(StringIO(r.text))
-        if df.empty: return None
-        # stooq: Close; yahoo: Adj Close|Close
+        if df.empty or "Date" not in df.columns: return None
         col = "Adj Close" if "Adj Close" in df.columns else ("Close" if "Close" in df.columns else None)
         if not col: return None
         s = pd.Series(df[col].values, index=pd.to_datetime(df["Date"]), name=name)
@@ -134,10 +105,10 @@ async def _fetch_many_csv_yahoo(tickers: list[str]) -> dict[str, pd.Series]:
     res = await asyncio.gather(*[go(t) for t in tickers])
     return {k:v for k,v in res if v is not None}
 
-# --- одиночный строгий загрузчик, как раньше ---
+# ---------- одиночный резерв (yfinance) ----------
 async def _fetch_one_close_strict(ticker: str) -> pd.Series|None:
     try:
-        df = await asyncio.wait_for(asyncio.to_thread(yf.download, ticker, **YF_OPTS), timeout=YF_BATCH_TIMEOUT)
+        df = await asyncio.wait_for(asyncio.to_thread(yf.download, ticker, **YF_OPTS), timeout=YF_SINGLE_TIMEOUT)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 lvl0=df.columns.get_level_values(0)
@@ -149,57 +120,55 @@ async def _fetch_one_close_strict(ticker: str) -> pd.Series|None:
             else:
                 col='Adj Close' if 'Adj Close' in df.columns else ('Close' if 'Close' in df.columns else None)
                 if col: return df[col].rename(ticker)
-    except Exception: pass
-    # CSV фоллбэки по одному
-    y = await _fetch_csv_one(YF_SESSION, *_yahoo_csv_url(ticker), name=ticker)
-    if y is not None and not y.dropna().empty: return y
-    s = await _fetch_csv_one(YF_SESSION, _stooq_csv_url(ticker), None, name=ticker)
-    return s
+    except Exception:
+        return None
+    return None
 
-# --- главный загрузчик матрицы цен ---
+def _trim_incomplete_daily(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        ny=ZoneInfo("America/New_York"); now=datetime.now(ny)
+        if df.empty: return df
+        if df.index.max().date()==now.date() and now.hour<23: return df.iloc[:-1]
+        return df
+    except Exception: return df
+
+# ---------- главный загрузчик ----------
 async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]]:
     need = tickers[:]
-    got, frames = [], []
+    got: list[str] = []
+    closes = pd.DataFrame()
 
-    # 1) yfinance мульти-батчами (с коротким дедлайном)
-    for i in range(0, len(need), BATCH_SIZE):
-        batch = need[i:i+BATCH_SIZE]
-        ok=False
-        for attempt in range(RETRIES):
-            try:
-                df = await asyncio.wait_for(asyncio.to_thread(yf.download, batch, **YF_OPTS), timeout=YF_BATCH_TIMEOUT)
-                close = _parse_close_from_multi(df, batch)
-                if not close.empty:
-                    frames.append(close); got.extend(list(close.columns)); ok=True
-                    break
-            except Exception:
-                await asyncio.sleep(BATCH_PAUSE*(2**attempt))
-        if not ok:
-            log.info("[yf] skip batch %s.. (timeout)", batch[:3])
-        await asyncio.sleep(BATCH_PAUSE)
+    # 1) Stooq CSV (параллельно)
+    stq = await _fetch_many_csv_stooq(need)
+    if stq:
+        stq_df = pd.concat(list(stq.values()), axis=1)
+        closes = stq_df
+        got.extend(stq_df.columns.tolist())
 
-    closes = pd.concat(frames, axis=1) if frames else pd.DataFrame()
-
-    # 2) Если данных мало/нет — массово тянем Stooq CSV параллельно
-    still = [t for t in need if t not in got]
-    if closes.empty or len(still) >= max(3, len(need)//3):
-        stq = await _fetch_many_csv_stooq(still if still else need)
-        if stq:
-            stq_df = pd.concat([v for v in stq.values()], axis=1)
-            closes = stq_df if closes.empty else closes.join(stq_df, how="outer")
-            got.extend(list(stq_df.columns))
-
-    # 3) Добираем оставшееся Yahoo CSV параллельно
+    # 2) Yahoo CSV (параллельно)
     still = [t for t in need if t not in got]
     if still:
-        ymap = await _fetch_many_csv_yahoo(still)
-        if ymap:
-            ydf = pd.concat([v for v in ymap.values()], axis=1)
-            closes = ydf if closes.empty else closes.join(ydf, how="outer")
-            got.extend(list(ydf.columns))
+        yahoo = await _fetch_many_csv_yahoo(still)
+        if yahoo:
+            yh_df = pd.concat(list(yahoo.values()), axis=1)
+            closes = yh_df if closes.empty else closes.join(yh_df, how="outer")
+            got.extend(yh_df.columns.tolist())
+
+    # 3) yfinance single (только если включили флаг)
+    still = [t for t in need if t not in got]
+    truly_bad = []
+    if YF_PRIMARY and still:
+        for tk in still:
+            s = await _fetch_one_close_strict(tk)
+            if s is None or s.dropna().empty:
+                truly_bad.append(tk)
+            else:
+                closes = s.to_frame() if closes.empty else closes.join(s, how="outer")
+    else:
+        truly_bad = still
 
     if closes.empty:
-        return pd.DataFrame(), need
+        return pd.DataFrame(), truly_bad
 
     closes = closes.loc[:, ~closes.columns.duplicated()]
     closes.index = pd.to_datetime(closes.index)
@@ -208,7 +177,7 @@ async def load_close_matrix(tickers: list[str]) -> tuple[pd.DataFrame, list[str]
     missing = [t for t in need if t not in closes.columns]
     return closes, missing
 
-# ---------- расчёты ----------
+# ---------- расчётные функции ----------
 def pct_change(series: pd.Series, periods: int) -> float:
     if len(series) < periods+1: return np.nan
     a=float(series.iloc[-periods-1]); b=float(series.iloc[-1])
@@ -225,6 +194,7 @@ def rank_pct(s: pd.Series) -> pd.Series: return s.rank(pct=True, method="average
 def composite_score(rs21_rel, rs63_rel, conf): return 0.45*rank_pct(rs21_rel.fillna(-1)) + 0.35*rank_pct(rs63_rel.fillna(-1)) + 0.20*conf.fillna(0)
 
 def pick_benchmark_for(ticker: str, closes: pd.DataFrame) -> str:
+    BENCH_CANDIDATES = ["SPY","QQQ","IWM","DIA","XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC"]
     cands=[b for b in BENCH_CANDIDATES if b in closes.columns]
     if not cands: return BENCH_DEFAULT
     s=closes[ticker].pct_change().dropna(); best=BENCH_DEFAULT; bc=-2
@@ -239,13 +209,13 @@ def fmt_row(i, tk, row): return f"{i}) {tk} | score={row['score']:.4f} | RS21={r
 async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, universe_name: str, tickers: list[str], top_n: int|None):
     if seen_message(update): return
     bench_need={BENCH_DEFAULT}
-    if BENCH_MODE=="smart": bench_need.update(BENCH_CANDIDATES)
+    if BENCH_MODE=="smart":
+        bench_need.update(["SPY","QQQ","IWM","DIA","XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC"])
     use_tickers = sanitize_us_tickers(sorted(set([t.upper() for t in tickers]+list(bench_need))))
     try:
-        closes, bad = await asyncio.wait_for(load_close_matrix(use_tickers), timeout=90)
+        closes, bad = await asyncio.wait_for(load_close_matrix(use_tickers), timeout=150)
     except asyncio.TimeoutError:
-        await update.message.reply_text("Источник котировок отвечает слишком долго. Попробуйте ещё раз позже.")
-        return
+        await update.message.reply_text("Источник котировок отвечает слишком долго. Попробуйте ещё раз позже."); return
 
     miss_for_universe=[t for t in tickers if t not in closes.columns]
     bad_all=sorted(set(bad+miss_for_universe))
@@ -276,8 +246,7 @@ async def universe_rank(update: Update, context: ContextTypes.DEFAULT_TYPE, univ
         rows.append({"ticker":tk,"bench":bench,"rs21_rel":rs21_rel,"rs63_rel":rs63_rel,"conf":conf})
 
     df=pd.DataFrame(rows).set_index("ticker")
-    if df.empty:
-        await update.message.reply_text("Нет валидных данных после загрузки котировок."); return
+    if df.empty: await update.message.reply_text("Нет валидных данных после загрузки котировок."); return
     df["score"]=composite_score(df["rs21_rel"], df["rs63_rel"], df["conf"])
     df_sorted=df.sort_values("score", ascending=False)
 
@@ -350,8 +319,6 @@ ETFX = [
     "GGLL","AAPU","FBL","MSFU","AMZU","NVDL","CONL"
 ]
 
-BENCH_CANDIDATES = ["SPY","QQQ","IWM","DIA","XLK","XLY","XLF","XLE","XLI","XLP","XLV","XLU","XLB","XLC"]
-
 # ---------- команды ----------
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if seen_message(update): return
@@ -363,10 +330,10 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     me = await context.bot.get_me()
     await update.message.reply_text(f"Bot: @{me.username} (id={me.id})\nMODE={BENCH_MODE}  DEFAULT_BENCH={BENCH_DEFAULT}\nTZ={BOT_TZ}")
 
-async def sp5005_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await universe_rank(update, context, "SP250", SP250, top_n=5)
+async def sp5005_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):  await universe_rank(update, context, "SP250", SP250, top_n=5)
 async def sp50010_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await universe_rank(update, context, "SP250", SP250, top_n=10)
-async def etfall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE): await universe_rank(update, context, "ETFALL", ETFALL, top_n=10)
-async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):   await universe_rank(update, context, "ETFX",   ETFX,   top_n=10)
+async def etfall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):   await universe_rank(update, context, "ETFALL", ETFALL, top_n=10)
+async def etfx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):     await universe_rank(update, context, "ETFX",   ETFX,   top_n=10)
 
 async def etf_full_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if seen_message(update): return
@@ -393,7 +360,7 @@ async def setbenchmark_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def benchcandidates_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if seen_message(update): return
-    await update.message.reply_text("Кандидаты SMART:\n" + " ".join(BENCH_CANDIDATES))
+    await update.message.reply_text("Кандидаты SMART:\nSPY QQQ IWM DIA XLK XLY XLF XLE XLI XLP XLV XLU XLB XLC")
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error: %s", context.error)
@@ -406,6 +373,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 def main() -> None:
     if not BOT_TOKEN: raise SystemExit("Set TELEGRAM_TOKEN env var.")
     app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+
+    # очищаем возможный webhook, чтобы не было конфликтов
+    import asyncio as _a
+    _a.get_event_loop().run_until_complete(app.bot.delete_webhook(drop_pending_updates=True))
 
     app.add_handler(CommandHandler("ping", ping_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
@@ -423,3 +394,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
